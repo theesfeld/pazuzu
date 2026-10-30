@@ -28,7 +28,55 @@
 (defvar *saw-request-octet* nil
   "Set when a request read consumes an octet. Idle timeouts stay quiet.")
 
+(defvar *read-ahead* nil
+  "Per-connection header buffer. SERVE-STREAM binds it. Writes stay on the
+socket stream, so this does not sit on the response path.")
+
+(defstruct read-ahead
+  (buffer (make-array 8192 :element-type '(unsigned-byte 8)))
+  (start 0)
+  (end 0))
+
+(defun socket-write-fd (stream)
+  "File descriptor of a cleartext socket stream, or NIL.
+A TLS stream is not a bare fd-stream, and sendfile cannot write it."
+  (when (typep stream 'sb-sys:fd-stream)
+    (sb-sys:fd-stream-fd stream)))
+
+(defun fill-read-ahead (stream)
+  "Pull octets the inner stream can return without waiting for a full buffer.
+read-sequence on a socket blocks until the destination is full, which stalls
+a short header. The first read-byte waits for one octet. listen is then true
+only for octets already buffered, and the loop stops before the next wait.
+Return NIL at EOF."
+  (let* ((ahead *read-ahead*)
+         (buffer (read-ahead-buffer ahead))
+         (first (read-byte stream nil :eof)))
+    (when (eq first :eof)
+      (setf (read-ahead-start ahead) 0
+            (read-ahead-end ahead) 0)
+      (return-from fill-read-ahead nil))
+    (setf (aref buffer 0) first)
+    (let ((end 1))
+      (loop while (and (< end (length buffer)) (listen stream))
+            for byte = (read-byte stream nil :eof)
+            until (eq byte :eof)
+            do (setf (aref buffer end) byte)
+               (incf end))
+      (setf (read-ahead-start ahead) 0
+            (read-ahead-end ahead) end))
+    t))
+
 (defun read-byte-eof (stream)
+  (let ((ahead *read-ahead*))
+    (when ahead
+      (when (>= (read-ahead-start ahead) (read-ahead-end ahead))
+        (unless (fill-read-ahead stream)
+          (return-from read-byte-eof :eof)))
+      (setf *saw-request-octet* t)
+      (return-from read-byte-eof
+        (prog1 (aref (read-ahead-buffer ahead) (read-ahead-start ahead))
+          (incf (read-ahead-start ahead))))))
   (let ((byte (read-byte stream nil :eof)))
     (unless (eq byte :eof)
       (setf *saw-request-octet* t))
@@ -61,12 +109,23 @@ ON-TOO-LONG is the status used when the line exceeds MAX-LENGTH."
                 (vector-push-extend byte buffer))))))
 
 (defun read-exact (stream count)
-  (let ((buffer (make-array count :element-type '(unsigned-byte 8))))
-    (loop for got = 0 then next
-          while (< got count)
+  (let ((buffer (make-array count :element-type '(unsigned-byte 8)))
+        (got 0)
+        (ahead *read-ahead*))
+    (when (and ahead (< (read-ahead-start ahead) (read-ahead-end ahead)))
+      (let ((take (min count (- (read-ahead-end ahead) (read-ahead-start ahead)))))
+        (replace buffer (read-ahead-buffer ahead)
+                 :start1 0 :end1 take
+                 :start2 (read-ahead-start ahead))
+        (incf (read-ahead-start ahead) take)
+        (setf got take)
+        (setf *saw-request-octet* t)))
+    (loop while (< got count)
           for next = (read-sequence buffer stream :start got)
           do (when (= next got)
-               (protocol-error 400 :detail "truncated body")))
+               (protocol-error 400 :detail "truncated body"))
+             (setf got next)
+             (setf *saw-request-octet* t))
     buffer))
 
 (defun append-octets (buffer more)

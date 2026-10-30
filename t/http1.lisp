@@ -5359,3 +5359,96 @@ PUT on that same store, whose validator now returns a tag, stays 200 or 204."
                (fail "connection stayed open")))
         (ignore-errors (usocket:socket-close socket))))))
 
+(defclass byte-source (sb-gray:fundamental-binary-input-stream)
+  ((data :initarg :data :reader byte-source-data)
+   (pos :initform 0 :accessor byte-source-pos)
+   (fills :initform 0 :accessor byte-source-fills)))
+
+(defmethod stream-element-type ((stream byte-source))
+  '(unsigned-byte 8))
+
+(defmethod sb-gray:stream-read-byte ((stream byte-source))
+  (incf (byte-source-fills stream))
+  (if (< (byte-source-pos stream) (length (byte-source-data stream)))
+      (prog1 (aref (byte-source-data stream) (byte-source-pos stream))
+        (incf (byte-source-pos stream)))
+      :eof))
+
+(defmethod sb-gray:stream-listen ((stream byte-source))
+  (< (byte-source-pos stream) (length (byte-source-data stream))))
+
+(defmethod sb-gray:stream-read-sequence ((stream byte-source) sequence
+                                         &optional (start 0) end)
+  (incf (byte-source-fills stream))
+  (let ((end (or end (length sequence)))
+        (data (byte-source-data stream)))
+    (loop while (and (< start end)
+                     (< (byte-source-pos stream) (length data)))
+          do (setf (aref sequence start) (aref data (byte-source-pos stream)))
+             (incf start)
+             (incf (byte-source-pos stream)))
+    start))
+
+(defun request-path-tests (server)
+  "TCP_NODELAY, one static stat per dispatch, and header bytes that cross a read buffer."
+  (check "header bytes that cross the read buffer stay in order"
+    (let* ((line-2 (make-string 250 :initial-element #\b))
+           ;; 7990 octets, CRLF, then a line that begins in the first
+           ;; 8192-octet refill and ends in the next one.
+           (mark (+ 7990 2))
+           (data (make-array (+ mark (length line-2) 2 3)
+                             :element-type '(unsigned-byte 8)
+                             :initial-element 65))
+           (source (make-instance 'byte-source :data data))
+           (pazuzu::*read-ahead* (pazuzu::make-read-ahead))
+           (stream source))
+      (setf (aref data 7990) 13
+            (aref data 7991) 10)
+      (replace data (pazuzu::ascii-octets (format nil "~a~c~c" line-2 #\Return #\Newline))
+               :start1 mark)
+      (replace data (pazuzu::ascii-octets "xyz")
+               :start1 (+ mark (length line-2) 2))
+      (let ((first (pazuzu::read-crlf-line stream 8000)))
+        (unless (= (length first) 7990)
+          (fail "first line length ~d" (length first))))
+      (let ((second (pazuzu::read-crlf-line stream 8000)))
+        (unless (string= second line-2)
+          (fail "second line ~s" second)))
+      (let ((body (pazuzu::read-exact stream 3)))
+        (unless (equalp body (pazuzu::ascii-octets "xyz"))
+          (fail "body ~s" body)))
+      ;; listen is true for the whole vector, so each refill drains it
+      ;; and every octet is read once.
+      (unless (= (byte-source-fills source) (length data))
+        (fail "inner reads ~d" (byte-source-fills source)))))
+  (check "one open for a static file in one dispatch"
+    (let ((pazuzu::*static-stat-calls* 0)
+          (pazuzu::*file-stat-cache* (make-hash-table :test #'equal))
+          (request (pazuzu::make-request :method "GET"
+                                         :path "/files/hello.txt"
+                                         :target "/files/hello.txt")))
+      (pazuzu::static-validator #p"/tmp/pazuzu-static/" "/files" request)
+      (let ((response (pazuzu::static-response #p"/tmp/pazuzu-static/" "/files" request)))
+        (unless (= (pazuzu:response-status response) 200)
+          (fail "status ~d" (pazuzu:response-status response))))
+      (unless (= pazuzu::*static-stat-calls* 1)
+        (fail "stat calls ~d" pazuzu::*static-stat-calls*))))
+  (let ((port (pazuzu::server-port server)))
+    (check "accepted HTTP/1 socket sets TCP_NODELAY"
+      (let ((socket (connect port)))
+        (unwind-protect
+             (let ((stream (usocket:socket-stream socket)))
+               (write-sequence (octets (request-text "GET / HTTP/1.1" "Host: 127.0.0.1"))
+                               stream)
+               (finish-output stream)
+               (expect-status (read-reply stream) 200)
+               (let ((clients (bt:with-lock-held ((pazuzu::server-lock server))
+                                (copy-list (pazuzu::server-clients server)))))
+                 (unless clients
+                   (fail "no accepted client"))
+                 (unless (every (lambda (client)
+                                  (pazuzu::tcp-nodelay-p (pazuzu::usocket-fd client)))
+                                clients)
+                   (fail "TCP_NODELAY is off"))))
+          (ignore-errors (usocket:socket-close socket)))))))
+

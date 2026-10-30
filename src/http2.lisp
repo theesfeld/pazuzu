@@ -23,6 +23,13 @@
 (defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-zero-return+ 6)
 
+(defparameter *h2-read-octets* 65536
+  "Octets read from one HTTP/2 connection before the next poll.")
+
+(defparameter *h2-inline-file-octets* 262144
+  "File responses at or below this size are one buffer. Larger files
+use a pipe thread so the image does not hold the whole span.")
+
 (alexandria:define-constant +h2-preface+
   (coerce #(80 82 73 32 42 32 72 84 84 80 47 50 46 48 13 10 13 10 83 77 13 10 13 10)
           '(simple-array (unsigned-byte 8) (*)))
@@ -415,9 +422,13 @@ decided to ignore. RFC 9113 still requires STREAM_CLOSED or PROTOCOL_ERROR."
               ((> (+ (length (h2-stream-body stream)) length)
                   (server-max-body (h2-conn-server conn)))
                (setf (h2-stream-overflow stream) t))
-              (t (loop for index below length
-                       do (vector-push-extend (cffi:mem-ref data :uint8 index)
-                                              (h2-stream-body stream)))))))
+              (t (let* ((chunk (foreign-to-octets data length))
+                        (body (h2-stream-body stream))
+                        (start (fill-pointer body)))
+                   (when (> (+ start length) (array-total-size body))
+                     (adjust-array body (max 16 (* 2 (+ start length)))))
+                   (incf (fill-pointer body) length)
+                   (replace body chunk :start1 start))))))
     0))
 
 (cffi:defcallback h2-data-read :long
@@ -441,7 +452,7 @@ decided to ignore. RFC 9113 still requires STREAM_CLOSED or PROTOCOL_ERROR."
              (let* ((octets (h2-stream-buffer stream))
                     (pos (h2-stream-buffer-pos stream))
                     (count (min length (max 0 (- (length octets) pos)))))
-               (octets-to-foreign (subseq octets pos (+ pos count)) buffer)
+               (octets-to-foreign-span octets pos count buffer)
                (incf (h2-stream-buffer-pos stream) count)
                (when (>= (h2-stream-buffer-pos stream) (length octets))
                  (setf (cffi:mem-ref data-flags :uint32) +h2-eof-flag+))
@@ -502,7 +513,16 @@ decided to ignore. RFC 9113 still requires STREAM_CLOSED or PROTOCOL_ERROR."
                              (and file (plusp (file-body-count file)))
                              (eq (h2-stream-source stream) :pipe)
                              (and known (plusp (length known)))))))
-    (when (and (or streaming file) send-body)
+    ;; A short file is one buffer. A thread and a pipe per response
+    ;; dominated the HTTP/2 static path: every 64-byte GET paid a
+    ;; context switch before nghttp2 could write DATA.
+    (when (and file send-body (<= (file-body-count file) *h2-inline-file-octets*))
+      (setf (h2-stream-source stream) :buffer
+            (h2-stream-buffer stream) (read-file-span file)
+            (h2-stream-buffer-pos stream) 0))
+    (when (and send-body
+               (or streaming
+                   (and file (not (eq (h2-stream-source stream) :buffer)))))
       (let ((pipe (make-octet-pipe
                    :on-output (lambda (ignored)
                                 (declare (ignore ignored))
@@ -1004,8 +1024,18 @@ Return true when any octets were consumed and the peer has not hung up."
                  (when (h2-consume-result conn buffer count)
                    (return nil))))))))
 
+(defun h2-ingest (conn buffer)
+  "Read until the socket would block, the peer closes, or nghttp2 fails.
+Return :OK, :EOF, or :FATAL."
+  (loop
+    (let ((count (h2-read-some (h2-conn-io conn) buffer *h2-read-octets*)))
+      (cond ((eq count :want-read) (return :ok))
+            ((or (eq count :eof) (not (numberp count))) (return :eof))
+            ((h2-consume-result conn buffer count) (return :fatal))))))
+
 (defun h2-loop (conn)
-  (let ((buffer (cffi:foreign-alloc :uint8 :count 16384)))
+  (let ((buffer (cffi:foreign-alloc :uint8 :count *h2-read-octets*))
+        (write-blocked nil))
     (unwind-protect
          (loop
            (when (h2-stopping conn)
@@ -1013,8 +1043,13 @@ Return true when any octets were consumed and the peer has not hung up."
              (return))
            (h2-resume-dirty conn)
            (let ((flushed (h2-flush conn)))
-             (when (or (eq flushed :eof) (and (numberp flushed) (< flushed 0)))
-               (return)))
+             (cond ((or (eq flushed :eof) (and (numberp flushed) (< flushed 0)))
+                    (return))
+                   ;; POLLOUT on a non-blocking socket that can already
+                   ;; take data returns at once. Waiting for it on every
+                   ;; pass spun one thread per connection.
+                   ((eq flushed :want-write) (setf write-blocked t))
+                   (t (setf write-blocked nil))))
            (when (h2-stopping conn)
              (h2-goaway conn)
              (return))
@@ -1028,7 +1063,10 @@ Return true when any octets were consumed and the peer has not hung up."
                                        (if (h2-conn-peer-goaway conn) 250 0))
                (return)))
            (let* ((socket-fd (h2-io-fd (h2-conn-io conn)))
-                  (revents (poll-fds (list (list socket-fd (logior +pollin+ +pollout+))
+                  (socket-mask (if write-blocked
+                                   (logior +pollin+ +pollout+)
+                                   +pollin+))
+                  (revents (poll-fds (list (list socket-fd socket-mask)
                                            (list (h2-conn-wake conn) +pollin+))
                                      1000))
                   (socket-events (or (first revents) 0))
@@ -1038,21 +1076,16 @@ Return true when any octets were consumed and the peer has not hung up."
                (return))
              (when (logtest socket-events (logior +pollnval+ +pollerr+ +pollhup+))
                (when (logtest socket-events +pollin+)
-                 (let ((count (h2-read-some (h2-conn-io conn) buffer 16384)))
-                   (when (numberp count)
-                     (h2-consume-result conn buffer count))))
+                 (h2-ingest conn buffer))
                (h2-flush conn)
                (return))
              (when (logtest wake-events +pollin+)
                (eventfd-drain (h2-conn-wake conn))
                (h2-resume-dirty conn))
              (when (logtest socket-events +pollin+)
-               (let ((count (h2-read-some (h2-conn-io conn) buffer 16384)))
-                 (cond ((eq count :eof)
-                        (h2-flush conn)
-                        (return))
-                       ((and (numberp count) (h2-consume-result conn buffer count))
-                        (return)))))))
+               (case (h2-ingest conn buffer)
+                 (:eof (h2-flush conn) (return))
+                 (:fatal (return))))))
       (when (h2-conn-session conn)
         (ignore-errors (h2-drain-pending conn buffer))
         (ignore-errors (h2-flush conn)))

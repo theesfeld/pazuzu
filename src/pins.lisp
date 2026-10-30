@@ -140,6 +140,57 @@ and a blocking read is what the HTTP/1.1 parser waits on."
     (setf (cffi:mem-ref value :int) 1)
     (%setsockopt fd 6 1 value (cffi:foreign-type-size :int))))
 
+(defun tcp-nodelay-p (fd)
+  "True when FD has TCP_NODELAY set."
+  (cffi:with-foreign-object (value :int)
+    (cffi:with-foreign-object (length :int)
+      (setf (cffi:mem-ref length :int) (cffi:foreign-type-size :int))
+      (and (zerop (%getsockopt fd 6 1 value length))
+           (= (cffi:mem-ref value :int) 1)))))
+
+(defconstant +einval+ 22)
+
+(cffi:defcfun ("sendfile" %sendfile) :long
+  (out-fd :int)
+  (in-fd :int)
+  (offset :pointer)
+  (count :unsigned-long))
+
+(defun sendfile-file-body (body stream)
+  "Write BODY with sendfile(2) when STREAM is a cleartext socket.
+Return T when the span was written that way. Return NIL when sendfile
+does not apply, so the caller reads the file instead. Headers already
+buffered on STREAM are flushed first: sendfile writes the descriptor
+directly."
+  (let ((out (socket-write-fd stream)))
+    (unless (and out (not (zerop out)))
+      (return-from sendfile-file-body nil))
+    (finish-output stream)
+    (with-open-file (in (file-body-pathname body)
+                        :element-type '(unsigned-byte 8))
+      (let ((remaining (file-body-count body))
+            (in-fd (sb-sys:fd-stream-fd in)))
+        (cffi:with-foreign-object (offset :int64)
+          (setf (cffi:mem-ref offset :int64) (file-body-start body))
+          (loop while (plusp remaining)
+                for wrote = (%sendfile out in-fd offset remaining)
+                do (cond ((plusp wrote)
+                          (decf remaining wrote))
+                         ((zerop wrote)
+                          (error "sendfile ended early for ~a"
+                                 (file-body-pathname body)))
+                         (t (let ((err (errno)))
+                              (cond ((= err +eintr+) nil)
+                                    ;; The first call rejected the pair of
+                                    ;; descriptors. The chunk path can still
+                                    ;; write the body behind the headers.
+                                    ((and (= err +einval+)
+                                          (= remaining (file-body-count body)))
+                                     (return-from sendfile-file-body nil))
+                                    (t (error "sendfile failed (~d) for ~a"
+                                              err (file-body-pathname body))))))))))
+      t)))
+
 (defun set-udp-dont-fragment (fd ipv6)
   "RFC 9000 §14. QUIC datagrams are not fragmented. An IPv4 socket always
 sets the DF bit. An IPv6 socket prohibits fragmentation."
@@ -384,6 +435,12 @@ and the ECN codepoint. NIL on EAGAIN or EINTR."
   (loop for byte across octets
         for index from 0
         do (setf (cffi:mem-ref pointer :uint8 index) byte)))
+
+(defun octets-to-foreign-span (octets start count pointer)
+  "Copy COUNT octets from OCTETS at START into POINTER. No intermediate vector."
+  (loop for index below count
+        do (setf (cffi:mem-ref pointer :uint8 index)
+                 (aref octets (+ start index)))))
 
 (defun native-version (function-name library expected label)
   (cffi:load-foreign-library library)
