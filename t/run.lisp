@@ -13,6 +13,7 @@ when any check fails."
      (lambda (server)
        (install-routes server)
        (http-tests (pazuzu::server-port server))
+       (request-path-tests server)
        (long-target-test (pazuzu::server-port server))
        (header-section-before-apply-test (pazuzu::server-port server))
        (single-range-test (pazuzu::server-port server))

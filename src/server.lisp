@@ -642,30 +642,43 @@ unacceptable coding is 406 and the precondition is ignored (RFC 9110
               nil
               result))))))
 
+(defvar *file-stat-cache* nil
+  "Equal hash of (root prefix path) to (pathname mtime length) for one DISPATCH.
+NIL outside DISPATCH. A miss stores the lookup, including a missing file.")
+
+(defvar *static-stat-calls* nil
+  "When this is a number, each uncached static open increments it.
+Tests use that to prove a request stats a file once.")
+
 (defun dispatch (server request)
+  "Answer REQUEST. Static-file stats are remembered until this call returns."
+  (let ((*file-stat-cache* (make-hash-table :test #'equal :size 2)))
+    (dispatch-request server request)))
+
+(defun dispatch-request (server request)
   (let ((misdirected (https-origin-rejected server request)))
     (when misdirected
-      (return-from dispatch misdirected)))
+      (return-from dispatch-request misdirected)))
   (let ((method (request-method request)))
     (unless (recognized-method-p method)
-      (return-from dispatch (plain-error 501)))
+      (return-from dispatch-request (plain-error 501)))
     (unless (implemented-method-p method)
-      (return-from dispatch (plain-error 501)))
+      (return-from dispatch-request (plain-error 501)))
     (when (and (string= method "OPTIONS") (string= (request-target request) "*"))
-      (return-from dispatch
+      (return-from dispatch-request
         (make-response :status 200
                        :headers `(("allow" . ,(allow-value *implemented-methods*)))
                        :body nil)))
     (let ((route (find-route server (request-path request) (request-host request))))
       (unless route
-        (return-from dispatch (plain-error 404)))
+        (return-from dispatch-request (plain-error 404)))
       (let ((preflight (preflight-response server route request)))
         (when preflight
-          (return-from dispatch preflight)))
+          (return-from dispatch-request preflight)))
       (when (and (route-websocket route) (websocket-handshake-p request))
-        (return-from dispatch :websocket))
+        (return-from dispatch-request :websocket))
       (when (route-websocket route)
-        (return-from dispatch
+        (return-from dispatch-request
           ;; RFC 9110 §15.6.15: a 426 carries Upgrade. HTTP/2 and HTTP/3
           ;; cannot carry that field (RFC 9113 §8.2.2, RFC 9114 §4.2).
           ;; A GET on those protocols is not an extended CONNECT.
@@ -677,14 +690,14 @@ unacceptable coding is 406 and the precondition is ignored (RFC 9110
                              :body "Upgrade Required")
               (plain-error 400))))
       (unless (method-allowed-p route method)
-        (return-from dispatch
+        (return-from dispatch-request
           (make-response :status 405
                          :headers `(("allow" . ,(allow-value (route-methods route))))
                          :content-type "text/plain; charset=utf-8"
                          :body "Method Not Allowed")))
       (when (and (string= method "OPTIONS")
                  (not (member "OPTIONS" (route-methods route) :test #'string=)))
-        (return-from dispatch
+        (return-from dispatch-request
           (make-response :status 200
                          :headers `(("allow" . ,(allow-value (route-methods route))))
                          :body nil)))
@@ -694,10 +707,10 @@ unacceptable coding is 406 and the precondition is ignored (RFC 9110
       ;; Digest nc is recorded only when the handler accepts the request.
       (let ((denied (reject-before-content (route-handler route) request)))
         (when denied
-          (return-from dispatch (ensure-allow denied route))))
+          (return-from dispatch-request (ensure-allow denied route))))
       (let ((guard (precondition-guard route request)))
         (when guard
-          (return-from dispatch (ensure-allow guard route))))
+          (return-from dispatch-request (ensure-allow guard route))))
       (let ((handler-method (if (string= method "HEAD") "GET" method))
             (existed (put-had-representation-p route request)))
         (declare (ignore handler-method))
@@ -913,6 +926,11 @@ finish with the status the method and target already decide."
                  nil))))))
 
 (defun serve-stream (server stream &key scheme peer redirect)
+  "Read and answer requests. The read-ahead buffer lives for this connection."
+  (let ((*read-ahead* (make-read-ahead)))
+    (serve-one-stream server stream :scheme scheme :peer peer :redirect redirect)))
+
+(defun serve-one-stream (server stream &key scheme peer redirect)
   (handler-case
       (loop
         (let ((started (get-internal-real-time))
@@ -1109,6 +1127,9 @@ until STOP."
                                                         :element-type '(unsigned-byte 8))))
                      (when client
                        (set-blocking (usocket-fd client))
+                       ;; HTTP/2 sets this again. HTTP/1 did not, so any
+                       ;; body past one segment waited on delayed ACK.
+                       (set-tcp-nodelay (usocket-fd client))
                        (note-thread server
                                     (bt:make-thread
                                      (lambda ()
@@ -1910,16 +1931,38 @@ is how long those connections may take to leave before the sockets are shut."
              (directory-child root (merge-pathnames "index.html" candidate)))
             (candidate candidate)))))
 
+(defun static-facts (root prefix request)
+  "PATHNAME, mtime, and length for the file REQUEST selects, or NIL NIL NIL.
+The body is not read. One DISPATCH shares a single open across the
+validator and the handler."
+  (flet ((lookup ()
+           (let ((file (static-file root prefix request)))
+             (cond ((and file (not (uiop:directory-pathname-p file)))
+                    (or (ignore-errors
+                          (when (numberp *static-stat-calls*)
+                            (incf *static-stat-calls*))
+                          (with-open-file (in file :element-type '(unsigned-byte 8))
+                            (list file
+                                  (min (or (file-write-date file) 0)
+                                       (get-universal-time))
+                                  (file-length in))))
+                        '(nil nil nil)))
+                   (t '(nil nil nil))))))
+    (let* ((key (list root prefix (request-path request)))
+           (hit (if *file-stat-cache*
+                    (or (gethash key *file-stat-cache*)
+                        (setf (gethash key *file-stat-cache*) (lookup)))
+                    (lookup))))
+      (values (first hit) (second hit) (third hit)))))
+
 (defun static-validator (root prefix request)
   "Return (mtime . length) for the file this request selects, or NIL.
 The body is not read. A false If-None-Match can be decided from this
 pair before the method (RFC 9110 §13.1.2)."
-  (let ((file (static-file root prefix request)))
-    (when (and file (probe-file file) (not (uiop:directory-pathname-p file)))
-      (ignore-errors
-        (with-open-file (in file :element-type '(unsigned-byte 8))
-          (cons (min (or (file-write-date file) 0) (get-universal-time))
-                (file-length in)))))))
+  (multiple-value-bind (file mtime length) (static-facts root prefix request)
+    (declare (ignore file))
+    (when length
+      (cons mtime length))))
 
 (defun static-etag (mtime length)
   ;; Length plus a one-second modification time does not change for every
@@ -1928,20 +1971,18 @@ pair before the method (RFC 9110 §13.1.2)."
   (format nil "W/\"~x-~x\"" length mtime))
 
 (defun static-response (root prefix request)
-  (let ((file (static-file root prefix request))
-        (validator (static-validator root prefix request)))
-    (unless (and file validator)
+  (multiple-value-bind (file mtime length) (static-facts root prefix request)
+    (unless (and file length)
       (return-from static-response (plain-error 404)))
-    ;; END is the length the validator already observed, so the body,
-    ;; Content-Length, and the weak etag describe the same span. The
-    ;; send path reads that span in chunks.
+    ;; END is the length the same open observed, so the body,
+    ;; Content-Length, and the weak etag describe the same span.
     (make-response :status 200
                    :body (make-file-body :pathname file
                                          :start 0
-                                         :end (cdr validator))
+                                         :end length)
                    :content-type (mime-type file)
-                   :etag (static-etag (car validator) (cdr validator))
-                   :last-modified (car validator)
+                   :etag (static-etag mtime length)
+                   :last-modified mtime
                    :headers '(("accept-ranges" . "bytes")))))
 
 (defun make-static-route (url-prefix directory &key host config)

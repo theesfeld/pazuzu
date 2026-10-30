@@ -726,8 +726,13 @@ A short read is an error: Content-Length was taken from this span."
       (unless (= pos limit)
         (error "short read of ~a" (file-body-pathname body))))))
 
+(declaim (ftype (function (t t) (values boolean &optional)) sendfile-file-body))
+
 (defun write-file-body (body stream)
-  (call-with-file-chunks body (lambda (chunk) (write-sequence chunk stream))))
+  "Write BODY to STREAM. A cleartext socket uses sendfile. Anything else
+reads the span in chunks."
+  (unless (sendfile-file-body body stream)
+    (call-with-file-chunks body (lambda (chunk) (write-sequence chunk stream)))))
 
 (defun read-file-span (body)
   "The span as one vector. Multipart ranges and similar framing need the
