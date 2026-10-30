@@ -46,6 +46,8 @@
   metrics-token
   request-rate
   (rate-windows (make-hash-table :test #'equal))
+  ;; Functions of (request next), outer first, around every route handler.
+  (middleware nil)
   user
   group
   config-path
@@ -66,7 +68,9 @@
   ;; NIL matches every host. A name matches only that host, port excluded.
   host
   ;; NIL is a Lisp route. :directory and :host are replaced from the file.
-  config)
+  config
+  ;; Functions of (request next), outer first, after the server chain.
+  middleware)
 
 (defstruct (cors-policy (:constructor make-cors-policy))
   origins
@@ -101,7 +105,7 @@ A host-scoped route at the same path stays."
   (and (null (route-host old))
        (string= (route-path old) path)))
 
-(defun add-route (server methods path handler &key prefix etag last-modified)
+(defun add-route (server methods path handler &key prefix etag last-modified middleware)
   "Register HANDLER for PATH. METHODS is a keyword or a list of keywords.
 GET implies HEAD. OPTIONS is answered for every registered resource.
 ETAG and LAST-MODIFIED are functions of the request. They are called
@@ -113,13 +117,52 @@ is present and Accept-Encoding is not."
                            :prefix prefix
                            :handler handler
                            :etag etag
-                           :last-modified last-modified)))
+                           :last-modified last-modified
+                           :middleware middleware)))
     (bt:with-lock-held ((server-lock server))
       (setf (server-routes server)
             (cons route (remove-if (lambda (old)
                                      (route-replaces-p old (route-path route)))
                                    (server-routes server)))))
     route))
+
+(defun add-middleware (server function)
+  "Append FUNCTION to SERVER's chain. FUNCTION takes the request and NEXT.
+NEXT is a function of the request and runs the rest of the chain, then
+the route handler. The list is replaced under the server lock."
+  (unless (functionp function)
+    (error "Middleware must be a function of (request next), not ~s" function))
+  (bt:with-lock-held ((server-lock server))
+    (setf (server-middleware server)
+          (append (server-middleware server) (list function))))
+  function)
+
+(defun call-with-chain (handler request chain)
+  "Call HANDLER on REQUEST after CHAIN. A symbol is funcalled, so the
+current definition runs."
+  (labels ((call-at (index)
+             (if (>= index (length chain))
+                 (funcall handler request)
+                 (funcall (nth index chain)
+                          request
+                          (lambda (request) (call-at (1+ index)))))))
+    (call-at 0)))
+
+(defun invoke-route (server route request)
+  "Run ROUTE's handler inside the middleware chain.
+ABORT-REQUEST ends this attempt with 500. RETRY-HANDLER calls the
+handler again. An error that no one handles still leaves this function."
+  (let ((chain (append (bt:with-lock-held ((server-lock server))
+                         (copy-list (server-middleware server)))
+                       (copy-list (route-middleware route)))))
+    (loop
+      (restart-case
+          (return (call-with-chain (route-handler route) request chain))
+        (abort-request ()
+          :report "Abort this request with 500."
+          (return (plain-error 500)))
+        (retry-handler ()
+          :report "Call the handler again.")))))
 
 (defun add-websocket-route (server path handler)
   (let ((route (make-route :methods '("GET")
@@ -719,7 +762,7 @@ Tests use that to prove a request stats a file once.")
           request
           (note-created-put
            request
-           (finalize-response request (normalize-result (funcall (route-handler route) request)))
+           (finalize-response request (normalize-result (invoke-route server route request)))
            existed))
          route)))))
 

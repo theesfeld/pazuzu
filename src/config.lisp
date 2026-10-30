@@ -43,6 +43,7 @@ WITH-STANDARD-IO-SYNTAX binds *read-eval* to true, so the nil binding is inside 
                 :redirect-port :access-log :error-log
                 :metrics-address :metrics-port :metrics-token
                 :request-rate :user :group :cors
+                :swank-port :slynk-port
                 :root :directories :hosts)
           :test #'eq))
 
@@ -303,9 +304,16 @@ Every present key is passed, including an explicit NIL such as :read-timeout.
                (:user (setf (getf args :user) value))
                (:group (setf (getf args :group) value))
                (:cors (setf (getf args :cors) (config-cors value)))
-               ((:root :directories :hosts))
+               ((:root :directories :hosts :swank-port :slynk-port))
                (t (error "Unknown configuration key ~s" key))))
     args))
+
+(defun start-configured-listeners (plist)
+  "Open a Swank or Slynk port when the file asks. The address is localhost."
+  (when (getf plist :swank-port)
+    (start-listener :interface :swank :port (getf plist :swank-port)))
+  (when (getf plist :slynk-port)
+    (start-listener :interface :slynk :port (getf plist :slynk-port))))
 
 (defun start-from-config (path)
   "Start a server from the property list in PATH."
@@ -317,6 +325,7 @@ Every present key is passed, including an explicit NIL such as :read-timeout.
       (error (condition)
         (ignore-errors (stop server))
         (error condition)))
+    (start-configured-listeners plist)
     server))
 
 (defun apply-runtime-config (server plist)
@@ -370,6 +379,12 @@ workers and routes as they were."
               (when (server-logger server)
                 (setf (logger-error-path (server-logger server)) (config-path value))))
              (:cors (setf (server-cors server) (config-cors value)))
+             (:swank-port
+              (when value
+                (start-listener :interface :swank :port value)))
+             (:slynk-port
+              (when value
+                (start-listener :interface :slynk :port value)))
              ((:root :directories :hosts)))))
 
 (defun reload (server)

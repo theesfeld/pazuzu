@@ -16,6 +16,12 @@
    #:main
    #:add-route
    #:add-websocket-route
+   #:add-middleware
+   #:defroute
+   #:start-listener
+   #:mount-lack
+   #:abort-request
+   #:retry-handler
    #:serve-directory
    #:make-cors-policy
    #:request

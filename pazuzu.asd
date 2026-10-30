@@ -32,6 +32,7 @@
                              (:file "http2")
                              (:file "http3")
                              (:file "server")
+                             (:file "app")
                              (:file "config"))))
   :in-order-to ((test-op (test-op "pazuzu/tests"))))
 
@@ -49,6 +50,7 @@
                              (:file "quic-path")
                              (:file "quic-http")
                              (:file "operate")
+                             (:file "app")
                              (:file "run"))))
   :perform (test-op (op system)
              (uiop:symbol-call :pazuzu/tests :run)))
