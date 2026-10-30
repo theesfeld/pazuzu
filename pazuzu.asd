@@ -52,6 +52,7 @@
                              (:file "operate")
                              (:file "app")
                              (:file "reliability")
+                             (:file "library")
                              (:file "run"))))
   :perform (test-op (op system)
              (uiop:symbol-call :pazuzu/tests :run)))

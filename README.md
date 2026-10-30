@@ -101,9 +101,35 @@ pazuzu --version
 pazuzu --log-level error --config /etc/pazuzu/config.lisp
 ```
 
-`SIGINT` and `SIGTERM` stop accepting, tell HTTP/2 and HTTP/3 to close, wait for in-flight connections, then exit. `SIGHUP` reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics token, the certificate chain, and the file mappings. The listen address, ports, backlog, and account do not change on reload; restart the service to change those.
+`SIGINT` and `SIGTERM` stop accepting, tell HTTP/2 and HTTP/3 to close, wait for in-flight connections, then exit. `SIGHUP` reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics token, the heap limit, the certificate chain, and the file mappings. The listen address, ports, backlog, and account do not change on reload; restart the service to change those. `SIGUSR2` hands the listening sockets to a new copy of this program (`script/handoff.py`) and then drains.
 
 ## Load from Lisp
+
+pazuzu is an ASDF system. Quicklisp and ocicl do not publish it yet. A
+release on those indexes is a separate request to quicklisp-projects or the
+ocicl index. Until then, load this repository. The native libraries still
+have to be the pinned build from `script/build-deps.sh`. `ql:quickload` and
+`asdf:load-system` both refuse a different nghttp2, ngtcp2, or nghttp3
+`version_num`.
+
+```sh
+PREFIX=/opt/pazuzu ./script/build-deps.sh
+export PATH="/opt/pazuzu/bin:$PATH"
+export LD_LIBRARY_PATH="/opt/pazuzu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Quicklisp finds a clone in `~/quicklisp/local-projects/pazuzu`:
+
+```sh
+git clone https://github.com/theesfeld/pazuzu.git ~/quicklisp/local-projects/pazuzu
+sbcl --load ~/quicklisp/setup.lisp --eval '(ql:quickload :pazuzu)' --quit
+```
+
+ocicl uses the same ASDF system. Put the clone where ASDF searches, for
+example `~/common-lisp/pazuzu`, with the native libraries on
+`LD_LIBRARY_PATH`, then `(asdf:load-system :pazuzu)`. The first load of
+`cffi-libffi` compiles a probe, so a C compiler has to be installed. The
+saved `pazuzu` binary does not need Quicklisp or ocicl at runtime.
 
 Clone the repository and load it from that directory:
 
@@ -324,6 +350,12 @@ If `LISTEN_PID` is this process and `LISTEN_FDS` is a positive integer, pazuzu a
 The unit installed by `make install` is `packaging/pazuzu.socket`. It listens on 80, 443/TCP, and 443/UDP.
 
 ## Use it from Lisp
+
+`examples/site.lisp` is a site written as a program: symbol handlers, `defroute`, and a middleware. Load pazuzu, then `(load "examples/site.lisp")` and `(pazuzu/example:start :port 8080)`. Redefining `pazuzu/example:home` changes the next request. The listeners stay up.
+
+`defroute` quotes a function name. `add-middleware` appends a function of `(request next)`. `mount-lack` sends a path to a function of a Lack environment; the function returns `(status headers body)`. Clack is not loaded. `start-listener` opens Swank or Slynk on `127.0.0.1` only, and only when called. `:swank-port` and `:slynk-port` in the config do the same. `:heap-limit` is a dynamic-space watermark in bytes. Above it, new connections are refused.
+
+`script/h3load.sh URL [COUNT]` sends COUNT HTTP/3 requests with one curl process. curl keeps the QUIC connection. The curl from `script/build-deps.sh` is the one with HTTP/3.
 
 `start` accepts the same keys as the configuration file. Paths are pathnames or namestrings. Port `0` binds an ephemeral port.
 

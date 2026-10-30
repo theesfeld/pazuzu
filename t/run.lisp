@@ -581,6 +581,8 @@ when any check fails."
     (http3-connection-cap-test cert key))
   (retry-secret-test)
   (redirect-date-test)
+  (example-site-test)
+  (h3load-test)
   (handler-case (handoff-test)
     (error (condition)
       (format t "FAIL handoff: ~a~%" condition)
