@@ -188,6 +188,7 @@ when any check fails."
      :cors cors))
   (capacity-and-timeout-tests)
   (production-tests)
+  (cli-tests)
   (config-file-tests)
   (rate-limit-test)
   (blocked-handler-test)

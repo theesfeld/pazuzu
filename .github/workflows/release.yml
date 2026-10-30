@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      PAZUZU_DEPS: /opt/pazuzu
+      LD_LIBRARY_PATH: /opt/pazuzu/lib
+      PATH: /opt/pazuzu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config cmake \
+            ca-certificates curl xz-utils python3 sbcl zlib1g-dev perl patchelf
+
+      - name: Build native libraries and the binary
+        run: |
+          sudo mkdir -p /opt/pazuzu
+          sudo chown -R "$USER" /opt/pazuzu
+          PREFIX=/opt/pazuzu ./script/build-deps.sh
+          if [ ! -f "$HOME/quicklisp/setup.lisp" ]; then
+            curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
+            sbcl --noinform --disable-debugger --load /tmp/quicklisp.lisp \
+              --eval '(quicklisp-quickstart:install)' \
+              --quit
+          fi
+          ./script/build-binary.sh
+          rm -rf stage
+          make install DESTDIR="$PWD/stage" PREFIX=/usr/local PAZUZU_DEPS=/opt/pazuzu
+          tar -C stage -czf "pazuzu-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" .
+
+      - name: Attach the tarball to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pazuzu-${{ github.ref_name }}-linux-x86_64.tar.gz
+          generate_release_notes: true

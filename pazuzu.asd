@@ -1,5 +1,6 @@
 (defsystem "pazuzu"
   :description "Origin server for HTTP/1.1, HTTP/2, and HTTP/3."
+  :version "0.1.0"
   :author "theesfeld <william@theesfeld.net>"
   :license "MIT"
   :depends-on ("alexandria"

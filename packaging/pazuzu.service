@@ -1,0 +1,45 @@
+[Unit]
+Description=pazuzu origin server
+Documentation=https://github.com/theesfeld/pazuzu
+Requires=pazuzu.socket
+After=pazuzu.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=pazuzu
+Group=pazuzu
+ExecStart=@PREFIX@/bin/pazuzu --config /etc/pazuzu/config.lisp
+Restart=on-failure
+RestartSec=1
+WorkingDirectory=/var/lib/pazuzu
+StateDirectory=pazuzu
+LogsDirectory=pazuzu
+# The pazuzu wrapper sets the same directory. This covers a direct
+# ExecStart of pazuzu-bin.
+Environment=LD_LIBRARY_PATH=@PREFIX@/lib/pazuzu
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# SBCL writes executable code pages. Denying that stops the process.
+MemoryDenyWriteExecute=false
+ReadOnlyPaths=/etc/pazuzu
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

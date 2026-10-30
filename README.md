@@ -47,18 +47,63 @@ sudo PREFIX=/usr/local ./script/build-deps.sh
 
 When the script is not run as root it prints the `PATH` and `LD_LIBRARY_PATH` to export. `PREFIX=/opt/pazuzu ./script/build-deps.sh` installs into a directory you can write.
 
-The same build is the Docker image. From the clone directory:
+## Installation
+
+The installed program is one executable, `pazuzu-bin`, plus a `pazuzu` wrapper. Quicklisp is used to build the image and is not needed to run it. Native libraries are installed under `PREFIX/lib/pazuzu`. The libraries record `$ORIGIN` so they find each other. The wrapper and the systemd unit set `LD_LIBRARY_PATH` to that directory. patchelf is not applied to the executable: changing its headers makes SBCL lose the embedded core.
+
+### From a release tarball
+
+A tag `v*` builds `pazuzu-<tag>-linux-x86_64.tar.gz` and attaches it to the GitHub release. The archive is a DESTDIR tree (`usr/local`, `etc/pazuzu`, `etc/systemd/system`).
 
 ```sh
-docker build -t pazuzu-deps .
-docker run --rm -v "$PWD":/src -w /src pazuzu-deps \
-  sbcl --noinform --disable-debugger \
-    --load /root/quicklisp/setup.lisp \
-    --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
-    --eval '(ql:quickload :pazuzu)'
+curl -fsSL -o pazuzu.tar.gz https://github.com/theesfeld/pazuzu/releases/download/v0.1.0/pazuzu-v0.1.0-linux-x86_64.tar.gz
+sudo tar -C / -xzf pazuzu.tar.gz
+sudo useradd --system --user-group --home-dir /var/lib/pazuzu --shell /usr/sbin/nologin pazuzu || true
+sudo install -d -o pazuzu -g pazuzu /var/lib/pazuzu/www /var/log/pazuzu
 ```
 
-## Install
+### From source
+
+`install.sh` builds the pinned libraries, saves the executable, installs them, and creates the `pazuzu` user. It is safe to run again: an existing `/etc/pazuzu/config.lisp` is left in place.
+
+```sh
+git clone https://github.com/theesfeld/pazuzu.git
+cd pazuzu
+sudo ./install.sh
+```
+
+`make` and `make install` are the same steps without creating the user. `PREFIX` defaults to `/usr/local`. `DESTDIR` prefixes every installed path, which is how a package is staged. `make uninstall` removes the binary, the private library directory, and the units, and leaves `/etc/pazuzu` and `/var/lib/pazuzu` in place.
+
+### Docker
+
+The image runs the same binary as `/usr/local/bin/pazuzu` and listens on 8080 until the config is replaced.
+
+```sh
+docker build -t pazuzu .
+docker run --rm -p 8080:8080 -v "$PWD/html:/var/lib/pazuzu/www" pazuzu
+```
+
+## Running as a service
+
+`packaging/pazuzu.socket` lets systemd bind port 80, port 443 TCP, and port 443 UDP. The names are `http`, `https`, and `quic`. pazuzu adopts those descriptors and does not bind them again, so the process does not need to be root. `packaging/pazuzu.service` runs as the `pazuzu` user with `Type=notify` (readiness is `sd_notify` / `READY=1`), `Restart=on-failure`, and a sandbox: `ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, an empty `CapabilityBoundingSet`, and related restrictions. `MemoryDenyWriteExecute` stays off because SBCL writes executable code pages.
+
+```sh
+sudo systemctl enable --now pazuzu.socket
+sudo systemctl status pazuzu.service
+```
+
+Logs go to stderr (notices and errors) and, for the foreground binary, access lines go to stdout, which journald records. A configured `:access-log` or `:error-log` is an additional file. `--log-level error` drops notice lines.
+
+```sh
+pazuzu --config /etc/pazuzu/config.lisp
+pazuzu --check-config /etc/pazuzu/config.lisp
+pazuzu --version
+pazuzu --log-level error --config /etc/pazuzu/config.lisp
+```
+
+`SIGINT` and `SIGTERM` stop accepting, tell HTTP/2 and HTTP/3 to close, wait for in-flight connections, then exit. `SIGHUP` reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics token, the certificate chain, and the file mappings. The listen address, ports, backlog, and account do not change on reload; restart the service to change those.
+
+## Load from Lisp
 
 Clone the repository and load it from that directory:
 
@@ -274,9 +319,9 @@ When `:metrics-token` is set, the scrape must send `Authorization: Bearer` and t
 
 If `LISTEN_PID` is this process and `LISTEN_FDS` is a positive integer, pazuzu adopts those listening sockets and does not bind the same roles again. This is the systemd `sd_listen_fds` protocol. Descriptors start at 3.
 
-`LISTEN_FDNAMES`, when set, is a colon-separated list. `http`, `https`, `web`, an empty name, or a missing name is the main listener. `metrics` is the Prometheus listener. `redirect` is the cleartext redirect listener. With no names, the first descriptor is the main listener. `:port` is not used for an adopted main listener.
+`LISTEN_FDNAMES`, when set, is a colon-separated list. `https` is the TLS listener. `http` is the main listener when no `https` socket was passed, and the cleartext redirect when `https` was. `redirect` is the cleartext listener. `web`, an empty name, or a missing name is the main listener. `metrics` is the Prometheus listener. A datagram socket, including one named `quic` or `http3`, is the HTTP/3 socket and is not bound again. With no names, the first stream socket is the main listener. `:port` is not used for an adopted main listener.
 
-`examples/pazuzu.socket` and `examples/pazuzu.service` are a socket-activated unit. `systemctl enable --now pazuzu.socket` passes the listening socket. The sample socket binds `127.0.0.1:8080` and names it `http`.
+The unit installed by `make install` is `packaging/pazuzu.socket`. It listens on 80, 443/TCP, and 443/UDP.
 
 ## Use it from Lisp
 

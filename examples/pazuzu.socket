@@ -1,13 +1,15 @@
 [Unit]
-Description=pazuzu HTTP socket
+Description=pazuzu HTTP sockets
 
 [Socket]
-# Loopback, matching examples/config.lisp. systemd passes this descriptor
-# as LISTEN_FDS with the name below. pazuzu adopts it and does not bind :port.
-ListenStream=127.0.0.1:8080
-FileDescriptorName=http
-# A second ListenStream named "metrics" or "redirect" is adopted as that role.
-# Leave metrics off here unless the config sets a token. See examples/config.lisp.
+# systemd binds these as root and passes the descriptors. The service
+# runs unprivileged. BindIPv6Only=both accepts IPv4 on the IPv6 sockets.
+BindIPv6Only=both
+ListenStream=[::]:80
+ListenStream=[::]:443
+ListenDatagram=[::]:443
+FileDescriptorName=http:https:quic
+Service=pazuzu.service
 
 [Install]
 WantedBy=sockets.target

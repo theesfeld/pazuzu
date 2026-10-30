@@ -114,6 +114,61 @@
     (when err
       (fail "main error ~a" err))))
 
+(defun cli-tests ()
+  (check "the version line names pazuzu"
+    (let ((text (with-output-to-string (*standard-output*)
+                  (pazuzu:main '("--version")))))
+      (unless (and (search "pazuzu" text) (search "0.1.0" text))
+        (fail "version ~s" text))))
+  (check "check-config accepts a file and rejects an unknown key"
+    (let ((path "/tmp/pazuzu-check-config.lisp"))
+      (write-config path '(:address "127.0.0.1" :port 9 :workers 1))
+      (let ((text (with-output-to-string (*standard-output*)
+                    (pazuzu:main (list "--check-config" path)))))
+        (unless (search "configuration ok" text)
+          (fail "check ~s" text)))
+      (write-config path '(:nope t))
+      (handler-case
+          (progn (pazuzu:main (list "--check-config" path))
+                 (fail "unknown key accepted"))
+        (error () nil))))
+  (check "an unknown command line flag is rejected"
+    (handler-case
+        (progn (pazuzu:main '("--not-a-flag"))
+               (fail "accepted an unknown flag"))
+      (error () nil)))
+  (check "log level error hides a notice"
+    (let ((pazuzu::*log-level* :error)
+          (lines nil))
+      (let ((*error-output* (make-string-output-stream)))
+        (pazuzu::error-log nil "notice" "hidden-notice")
+        (pazuzu::error-log nil "error" "shown-error")
+        (setf lines (get-output-stream-string *error-output*)))
+      (when (search "hidden-notice" lines)
+        (fail "notice leaked ~s" lines))
+      (unless (search "shown-error" lines)
+        (fail "error missing ~s" lines))))
+  (check "sd_notify sends READY to NOTIFY_SOCKET"
+    (let* ((path "/tmp/pazuzu-notify.sock")
+           (sock (make-instance 'sb-bsd-sockets:local-socket :type :datagram)))
+      (ignore-errors (delete-file path))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind sock path)
+             (sb-posix:setenv "NOTIFY_SOCKET" path 1)
+             (pazuzu::sd-notify "READY=1")
+             (let ((buf (make-array 32 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (got len)
+                   (sb-bsd-sockets:socket-receive sock buf nil)
+                 (declare (ignore got))
+                 (unless (string= (babel:octets-to-string (subseq buf 0 len)
+                                                          :encoding :utf-8)
+                                  "READY=1")
+                   (fail "notify ~s" (subseq buf 0 len))))))
+        (sb-posix:unsetenv "NOTIFY_SOCKET")
+        (ignore-errors (sb-bsd-sockets:socket-close sock))
+        (ignore-errors (delete-file path))))))
+
 (defun config-file-tests ()
   (check "the example configuration shows file mappings and serves none"
     (let* ((example (asdf:system-relative-pathname :pazuzu "examples/config.lisp"))
