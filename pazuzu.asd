@@ -1,11 +1,12 @@
 (defsystem "pazuzu"
   :description "Origin server for HTTP/1.1, HTTP/2, and HTTP/3."
-  :author "pazuzu"
+  :author "theesfeld <william@theesfeld.net>"
   :license "MIT"
   :depends-on ("alexandria"
                "babel"
                "bordeaux-threads"
                "cffi"
+               "cffi-libffi"
                "chipz"
                "cl-base64"
                "cl+ssl"
@@ -37,6 +38,16 @@
   :depends-on ("pazuzu")
   :serial t
   :components ((:module "t"
-                :components ((:file "run"))))
+                :components ((:file "package")
+                             (:file "support")
+                             (:file "http1")
+                             (:file "websocket")
+                             (:file "http2")
+                             (:file "http3")
+                             (:file "quic")
+                             (:file "quic-path")
+                             (:file "quic-http")
+                             (:file "operate")
+                             (:file "run"))))
   :perform (test-op (op system)
              (uiop:symbol-call :pazuzu/tests :run)))

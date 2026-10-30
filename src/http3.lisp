@@ -189,13 +189,19 @@
 (cffi:defcfun ("SSL_set_ex_data" %ssl-set-ex-data :library cl+ssl::libssl) :int
   (ssl :pointer) (index :int) (arg :pointer))
 
-(sb-alien:define-alien-type h3-vec
-    (sb-alien:struct h3-vec
-      (base (* (sb-alien:unsigned 8)))
-      (len sb-alien:unsigned-long)))
+;; Returned by value. libffi matches the System V register return.
+;; sb-alien on SBCL 2.2.9 reads that 16-byte struct from the wrong place
+;; and treats a pointer as the length. cffi-libffi has to be loaded
+;; before this macro expands.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (asdf:load-system :cffi-libffi))
+(cffi:defcstruct nghttp3-vec
+  (base :pointer)
+  (len :unsigned-long))
 
-(sb-alien:define-alien-routine ("nghttp3_rcbuf_get_buf" %h3-rcbuf-buf) h3-vec
-  (rcbuf sb-alien:system-area-pointer))
+(cffi:defcfun ("nghttp3_rcbuf_get_buf" %h3-rcbuf-buf :library libnghttp3)
+    (:struct nghttp3-vec)
+  (rcbuf :pointer))
 
 (defvar *h3-quic-callbacks* nil)
 (defvar *h3-http-callbacks* nil)
@@ -414,15 +420,18 @@ in the packet info. The socket default stays NOT_ECT."
         (ignore-errors (nghttp3-resume-stream (h3-conn-http3 conn) id))))))
 
 (defun rcbuf-latin1 (rcbuf)
-  (let ((vec (%h3-rcbuf-buf (sb-sys:int-sap (cffi:pointer-address rcbuf)))))
-    (unwind-protect
-         (let ((len (sb-alien:slot vec 'len))
-               (base (sb-alien:slot vec 'base)))
-           (let ((octets (make-array len :element-type '(unsigned-byte 8))))
-             (dotimes (index len)
-               (setf (aref octets index) (sb-alien:deref base index)))
-             (babel:octets-to-string octets :encoding :iso-8859-1)))
-      (sb-alien:free-alien vec))))
+  "Latin-1 text of an nghttp3 rcbuf. %H3-RCBUF-BUF returns the vec by
+value as a property list (base pointer, length)."
+  (let* ((vec (%h3-rcbuf-buf rcbuf))
+         (len (getf vec 'len))
+         (base (getf vec 'base)))
+    (unless (and (numberp len) (<= len (ash 1 20))
+                 base (not (cffi:null-pointer-p base)))
+      (error "rcbuf length ~a" len))
+    (let ((octets (make-array len :element-type '(unsigned-byte 8))))
+      (loop for index below len
+            do (setf (aref octets index) (cffi:mem-ref base :uint8 index)))
+      (babel:octets-to-string octets :encoding :iso-8859-1))))
 
 (defun h3-extend (conn stream-id amount)
   (when (and conn (h3-conn-quic conn) (not (h3-conn-freed conn)) (plusp amount))
@@ -511,12 +520,14 @@ in the packet info. The socket default stays NOT_ECT."
   (let* ((status (response-status response))
          (body (emitted-body response))
          (streaming (functionp body))
-         (known (unless streaming (response-octets body)))
+         (file (and (file-body-p body) body))
+         (known (unless (or streaming file) (response-octets body)))
          (send-body (and (status-has-body-p status) (not head)
                          (or streaming
+                             (and file (plusp (file-body-count file)))
                              (eq (h3-stream-source stream) :pipe)
                              (and known (plusp (length known)))))))
-    (when (and streaming send-body)
+    (when (and (or streaming file) send-body)
       (let ((pipe (make-octet-pipe
                    :on-output (lambda (ignored)
                                 (declare (ignore ignored))
@@ -528,21 +539,29 @@ in the packet info. The socket default stays NOT_ECT."
                       (lambda ()
                         (unwind-protect
                              (handler-case
-                                 (funcall body
-                                          (lambda (octets)
-                                            (write-sequence (simple-octets octets) pipe)
-                                            (finish-output pipe)))
+                                 (if file
+                                     (call-with-file-chunks
+                                      file
+                                      (lambda (octets)
+                                        (write-sequence octets pipe)
+                                        (finish-output pipe)))
+                                     (funcall body
+                                              (lambda (octets)
+                                                (write-sequence (simple-octets octets) pipe)
+                                                (finish-output pipe))))
                                (error (condition)
                                  (format *error-output* "pazuzu: stream: ~a~%" condition)))
                           (pipe-shutdown pipe)))
                       :name "pazuzu-stream"))))
-    (when (and send-body known (not streaming)
+    (when (and send-body known (not streaming) (not file)
                (not (eq (h3-stream-source stream) :pipe)))
       (setf (h3-stream-source stream) :buffer
             (h3-stream-buffer stream) known
             (h3-stream-buffer-pos stream) 0))
     (let ((fields (response-wire-fields response)))
-      (when (eq (h3-stream-source stream) :pipe)
+      ;; A function stream has no length. A file span does, and the pipe
+      ;; writes exactly that many octets.
+      (when (and (eq (h3-stream-source stream) :pipe) (not file))
         (setf fields (remove "content-length" fields :key #'car :test #'string=)))
       (setf (h3-stream-submitted stream) t)
       (call-with-nv fields

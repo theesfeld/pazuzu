@@ -495,12 +495,14 @@ decided to ignore. RFC 9113 still requires STREAM_CLOSED or PROTOCOL_ERROR."
   (let* ((status (response-status response))
          (body (emitted-body response))
          (streaming (functionp body))
-         (known (unless streaming (response-octets body)))
+         (file (and (file-body-p body) body))
+         (known (unless (or streaming file) (response-octets body)))
          (send-body (and provider (status-has-body-p status) (not head)
                          (or streaming
+                             (and file (plusp (file-body-count file)))
                              (eq (h2-stream-source stream) :pipe)
                              (and known (plusp (length known)))))))
-    (when (and streaming send-body)
+    (when (and (or streaming file) send-body)
       (let ((pipe (make-octet-pipe
                    :on-output (lambda (ignored)
                                 (declare (ignore ignored))
@@ -512,21 +514,29 @@ decided to ignore. RFC 9113 still requires STREAM_CLOSED or PROTOCOL_ERROR."
                       (lambda ()
                         (unwind-protect
                              (handler-case
-                                 (funcall body
-                                          (lambda (octets)
-                                            (write-sequence (simple-octets octets) pipe)
-                                            (finish-output pipe)))
+                                 (if file
+                                     (call-with-file-chunks
+                                      file
+                                      (lambda (octets)
+                                        (write-sequence octets pipe)
+                                        (finish-output pipe)))
+                                     (funcall body
+                                              (lambda (octets)
+                                                (write-sequence (simple-octets octets) pipe)
+                                                (finish-output pipe))))
                                (error (condition)
                                  (format *error-output* "pazuzu: stream: ~a~%" condition)))
                           (pipe-shutdown pipe)))
                       :name "pazuzu-stream"))))
-    (when (and send-body known (not streaming)
+    (when (and send-body known (not streaming) (not file)
                (not (eq (h2-stream-source stream) :pipe)))
       (setf (h2-stream-source stream) :buffer
             (h2-stream-buffer stream) known
             (h2-stream-buffer-pos stream) 0))
     (let ((fields (response-wire-fields response)))
-      (when (eq (h2-stream-source stream) :pipe)
+      ;; A function stream has no length. A file span does, and the pipe
+      ;; writes exactly that many octets.
+      (when (and (eq (h2-stream-source stream) :pipe) (not file))
         (setf fields (remove "content-length" fields :key #'car :test #'string=)))
       (call-with-nv fields
         (lambda (nva count)
