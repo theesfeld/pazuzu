@@ -1,10 +1,16 @@
+;; WARNING: metrics below listen on port 9090 with no :metrics-token.
+;; Anyone who can open that socket can read the Prometheus exposition.
+;; :metrics-address is 127.0.0.1, so that is this machine only. Do not
+;; point it at a public or wildcard address unless :metrics-token is set.
+;; A missing token is not authentication.
+;;
 ;; pazuzu configuration. This file is data, not a program.
 ;; The server reads it with *read-eval* bound to nil.
 ;;
 ;; Start in the foreground from the clone directory:
 ;;   sbcl --noinform --disable-debugger \
 ;;     --load ~/quicklisp/setup.lisp \
-;;     --eval '(asdf:load-asd "pazuzu.asd")' \
+;;     --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
 ;;     --eval '(ql:quickload :pazuzu)' \
 ;;     --eval '(pazuzu:main)' -- examples/config.lisp
 ;;
@@ -60,6 +66,8 @@
  :access-log "log/access.log"
  :error-log "log/error.log"
  ;; Prometheus text at /metrics. Omit :metrics-port to leave it off.
+ ;; WARNING: this port is open with no token. Keep :metrics-address on
+ ;; 127.0.0.1, or set :metrics-token before binding any other address.
  ;; :metrics-token, when set, requires Authorization: Bearer <token>.
  :metrics-address "127.0.0.1"
  :metrics-port 9090

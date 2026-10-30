@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PREFIX: /opt/pazuzu
+      LD_LIBRARY_PATH: /opt/pazuzu/lib
+      PKG_CONFIG_PATH: /opt/pazuzu/lib/pkgconfig
+      PATH: /opt/pazuzu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config cmake \
+            ca-certificates curl xz-utils python3 python3-venv python3-pip \
+            sbcl zlib1g-dev perl nodejs
+
+      - name: Cache native libraries
+        uses: actions/cache@v4
+        with:
+          path: /opt/pazuzu
+          key: pazuzu-deps-v1-${{ hashFiles('script/build-deps.sh') }}
+
+      - name: Build pinned native libraries
+        run: |
+          sudo mkdir -p /opt/pazuzu
+          sudo chown -R "$USER" /opt/pazuzu
+          ./script/build-deps.sh
+          echo "/opt/pazuzu/lib" | sudo tee /etc/ld.so.conf.d/pazuzu.conf
+          sudo ldconfig
+          test "$(pkg-config --modversion libnghttp2)" = "1.70.0"
+          test "$(pkg-config --modversion libngtcp2)" = "1.25.0"
+          test "$(pkg-config --modversion libnghttp3)" = "1.18.0"
+          test -e /opt/pazuzu/lib/libngtcp2_crypto_ossl.so
+          curl --version | head -n 2
+          curl --version | grep -q HTTP3
+
+      - name: Install Quicklisp and aioquic
+        run: |
+          if [ ! -f "$HOME/quicklisp/setup.lisp" ]; then
+            curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
+            sbcl --noinform --disable-debugger --load /tmp/quicklisp.lisp \
+              --eval '(quicklisp-quickstart:install)' \
+              --quit
+          fi
+          python3 -m venv /tmp/pazuzu-h3venv
+          /tmp/pazuzu-h3venv/bin/pip install --disable-pip-version-check 'aioquic==1.2.0'
+
+      - name: Load pazuzu and run the test suite
+        run: |
+          sbcl --dynamic-space-size 4096 --noinform --disable-debugger \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
+            --eval '(ql:quickload :pazuzu)' \
+            --eval '(asdf:test-system :pazuzu)' \
+            --quit
+
+      - name: h2spec 2.6.0
+        run: |
+          curl -fsSL -o /tmp/h2spec.tar.gz \
+            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          tar -C /tmp -xzf /tmp/h2spec.tar.gz
+          sbcl --noinform --disable-debugger \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
+            --eval '(ql:quickload :pazuzu)' \
+            --load script/h2spec-server.lisp &
+          server_pid=$!
+          trap 'kill "$server_pid" || true' EXIT
+          ready=0
+          for _ in $(seq 1 100); do
+            if curl -sf -o /dev/null --max-time 1 http://127.0.0.1:18080/; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          test "$ready" = 1
+          /tmp/h2spec -h 127.0.0.1 -p 18080 -o 5

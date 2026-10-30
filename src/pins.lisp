@@ -178,20 +178,82 @@ on each datagram. IP_RECVTOS is 13. IPV6_RECVTCLASS is 66."
                         value
                         (cffi:foreign-type-size :int)))))
 
+;; Linux x86_64 System V. CFFI inserts the 4-byte pad after msg_namelen.
+;; assert-posix-layout refuses any other shape instead of sending a
+;; datagram with the fields in the wrong places.
+(cffi:defcstruct iovec
+  (iov-base :pointer)
+  (iov-len :unsigned-long))
+
+(cffi:defcstruct msghdr
+  (msg-name :pointer)
+  (msg-namelen :unsigned-int)
+  (msg-iov :pointer)
+  (msg-iovlen :unsigned-long)
+  (msg-control :pointer)
+  (msg-controllen :unsigned-long)
+  (msg-flags :int))
+
+(cffi:defcstruct cmsghdr
+  (cmsg-len :unsigned-long)
+  (cmsg-level :int)
+  (cmsg-type :int))
+
+(defun assert-posix-layout ()
+  (unless (and (= 8 (cffi:foreign-type-size :pointer))
+               (= 8 (cffi:foreign-type-size :unsigned-long))
+               (= 4 (cffi:foreign-type-size :unsigned-int))
+               (= 16 (cffi:foreign-type-size '(:struct iovec)))
+               (= 56 (cffi:foreign-type-size '(:struct msghdr)))
+               (= 0 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-name))
+               (= 8 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-namelen))
+               (= 16 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-iov))
+               (= 24 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-iovlen))
+               (= 32 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-control))
+               (= 40 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-controllen))
+               (= 48 (cffi:foreign-slot-offset '(:struct msghdr) 'msg-flags))
+               (= 16 (cffi:foreign-type-size '(:struct cmsghdr)))
+               (= 8 (cffi:foreign-slot-offset '(:struct cmsghdr) 'cmsg-level))
+               (= 12 (cffi:foreign-slot-offset '(:struct cmsghdr) 'cmsg-type)))
+    (error "msghdr layout is not the Linux x86_64 ABI this server sends datagrams with")))
+
+(assert-posix-layout)
+
+(defun msghdr-ref (message slot)
+  (cffi:foreign-slot-value message '(:struct msghdr) slot))
+
+(defun (setf msghdr-ref) (value message slot)
+  (setf (cffi:foreign-slot-value message '(:struct msghdr) slot) value))
+
+(defun iovec-ref (iov slot)
+  (cffi:foreign-slot-value iov '(:struct iovec) slot))
+
+(defun (setf iovec-ref) (value iov slot)
+  (setf (cffi:foreign-slot-value iov '(:struct iovec) slot) value))
+
+(defun cmsg-ref (control slot)
+  (cffi:foreign-slot-value control '(:struct cmsghdr) slot))
+
+(defun (setf cmsg-ref) (value control slot)
+  (setf (cffi:foreign-slot-value control '(:struct cmsghdr) slot) value))
+
 (defun control-ecn (control length ipv6)
   "The ECN codepoint from one recvmsg control buffer, or 0."
   (let ((offset 0)
-        (ecn 0))
-    (loop while (and (< offset length) (>= (- length offset) 16))
-          for cmsg-len = (cffi:mem-ref control :unsigned-long offset)
-          while (and (>= cmsg-len 16) (<= (+ offset cmsg-len) length))
-          do (when (and (>= cmsg-len 20)
+        (ecn 0)
+        (header (cffi:foreign-type-size '(:struct cmsghdr))))
+    (loop while (and (< offset length) (>= (- length offset) header))
+          for cmsg = (cffi:inc-pointer control offset)
+          for cmsg-len = (cmsg-ref cmsg 'cmsg-len)
+          while (and (>= cmsg-len header) (<= (+ offset cmsg-len) length))
+          do (when (and (>= cmsg-len (+ header 4))
                         (if ipv6
-                            (and (= (cffi:mem-ref control :int (+ offset 8)) 41)
-                                 (= (cffi:mem-ref control :int (+ offset 12)) 67))
-                            (and (= (cffi:mem-ref control :int (+ offset 8)) 0)
-                                 (= (cffi:mem-ref control :int (+ offset 12)) 1))))
-               (setf ecn (logand (cffi:mem-ref control :uint8 (+ offset 16)) 3)))
+                            (and (= (cmsg-ref cmsg 'cmsg-level) 41)
+                                 (= (cmsg-ref cmsg 'cmsg-type) 67))
+                            (and (= (cmsg-ref cmsg 'cmsg-level) 0)
+                                 (= (cmsg-ref cmsg 'cmsg-type) 1))))
+               (setf ecn (logand (cffi:mem-ref (cffi:inc-pointer cmsg header) :uint8) 3)))
+             ;; CMSG_ALIGN on this ABI is alignment to 8.
              (let ((step (logand (+ cmsg-len 7) (lognot 7))))
                (when (zerop step)
                  (return))
@@ -201,28 +263,30 @@ on each datagram. IP_RECVTOS is 13. IPV6_RECVTCLASS is 66."
 (defun udp-sendmsg (fd host port buffer length ecn)
   "Send one datagram. ECN is the two-bit codepoint. Zero sends NOT_ECT and
 attaches no traffic-class message, so a previous datagram cannot stick."
-  (cffi:with-foreign-objects ((message :uint8 56)
-                              (iov :uint8 16)
+  (cffi:with-foreign-objects ((message '(:struct msghdr))
+                              (iov '(:struct iovec))
                               (name :uint8 28)
                               (control :uint8 32))
-    (foreign-zero message 56)
+    (foreign-zero message (cffi:foreign-type-size '(:struct msghdr)))
     (foreign-zero control 32)
     (let ((namelen (fill-sockaddr name host port))
           (ipv6 (ipv6-host-p host))
-          (mark (logand ecn 3)))
-      (setf (cffi:mem-ref iov :pointer) buffer
-            (cffi:mem-ref iov :unsigned-long 8) length
-            (cffi:mem-ref message :pointer) name
-            (cffi:mem-ref message :unsigned-int 8) namelen
-            (cffi:mem-ref message :pointer 16) iov
-            (cffi:mem-ref message :unsigned-long 24) 1)
+          (mark (logand ecn 3))
+          (header (cffi:foreign-type-size '(:struct cmsghdr))))
+      (setf (iovec-ref iov 'iov-base) buffer
+            (iovec-ref iov 'iov-len) length
+            (msghdr-ref message 'msg-name) name
+            (msghdr-ref message 'msg-namelen) namelen
+            (msghdr-ref message 'msg-iov) iov
+            (msghdr-ref message 'msg-iovlen) 1)
       (when (plusp mark)
-        (setf (cffi:mem-ref control :unsigned-long) 20
-              (cffi:mem-ref control :int 8) (if ipv6 41 0)
-              (cffi:mem-ref control :int 12) (if ipv6 67 1)
-              (cffi:mem-ref control :int 16) mark
-              (cffi:mem-ref message :pointer 32) control
-              (cffi:mem-ref message :unsigned-long 40) 24))
+        (setf (cmsg-ref control 'cmsg-len) (+ header 4)
+              (cmsg-ref control 'cmsg-level) (if ipv6 41 0)
+              (cmsg-ref control 'cmsg-type) (if ipv6 67 1)
+              (cffi:mem-ref (cffi:inc-pointer control header) :int) mark
+              (msghdr-ref message 'msg-control) control
+              ;; 20 octets of cmsg, aligned up to 24.
+              (msghdr-ref message 'msg-controllen) 24))
       (let ((n (%sendmsg fd message +msg-dontwait+)))
         (cond ((>= n 0) n)
               ((member (errno) (list +eagain+ +eintr+)) nil)
@@ -231,22 +295,22 @@ attaches no traffic-class message, so a previous datagram cannot stick."
 (defun udp-recvmsg (fd buffer ipv6)
   "Read one datagram into BUFFER. Return BUFFER, length, host octets, port,
 and the ECN codepoint. NIL on EAGAIN or EINTR."
-  (cffi:with-foreign-objects ((message :uint8 56)
-                              (iov :uint8 16)
+  (cffi:with-foreign-objects ((message '(:struct msghdr))
+                              (iov '(:struct iovec))
                               (name :uint8 28)
                               (control :uint8 32))
-    (foreign-zero message 56)
+    (foreign-zero message (cffi:foreign-type-size '(:struct msghdr)))
     (foreign-zero name 28)
     (foreign-zero control 32)
     (cffi:with-pointer-to-vector-data (pointer buffer)
-      (setf (cffi:mem-ref iov :pointer) pointer
-            (cffi:mem-ref iov :unsigned-long 8) (length buffer)
-            (cffi:mem-ref message :pointer) name
-            (cffi:mem-ref message :unsigned-int 8) 28
-            (cffi:mem-ref message :pointer 16) iov
-            (cffi:mem-ref message :unsigned-long 24) 1
-            (cffi:mem-ref message :pointer 32) control
-            (cffi:mem-ref message :unsigned-long 40) 32)
+      (setf (iovec-ref iov 'iov-base) pointer
+            (iovec-ref iov 'iov-len) (length buffer)
+            (msghdr-ref message 'msg-name) name
+            (msghdr-ref message 'msg-namelen) 28
+            (msghdr-ref message 'msg-iov) iov
+            (msghdr-ref message 'msg-iovlen) 1
+            (msghdr-ref message 'msg-control) control
+            (msghdr-ref message 'msg-controllen) 32)
       (let ((n (%recvmsg fd message +msg-dontwait+)))
         (cond ((> n 0)
                (let* ((family (cffi:mem-ref name :uint16))
@@ -255,7 +319,7 @@ and the ECN codepoint. NIL on EAGAIN or EINTR."
                       (host (case family
                               (2 (foreign-to-octets (cffi:inc-pointer name 4) 4))
                               (10 (foreign-to-octets (cffi:inc-pointer name 8) 16))))
-                      (used (cffi:mem-ref message :unsigned-long 40)))
+                      (used (msghdr-ref message 'msg-controllen)))
                  (when host
                    (values buffer n host port
                            (control-ecn control (min 32 (max 0 used)) ipv6)))))

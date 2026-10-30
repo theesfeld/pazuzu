@@ -685,6 +685,66 @@ HTTP/1.1 still frames that empty content with Content-Length: 0."
       (write-ascii stream value)
       (write-crlf stream))))
 
+(defstruct file-body
+  "Bytes of one file, from START inclusive to END exclusive.
+END nil means the length observed when the span is read. The send path
+reads the span in chunks instead of holding the file."
+  pathname
+  (start 0)
+  (end nil))
+
+(defparameter *file-read-chunk* 16384
+  "Octets read from a file body at one time.")
+
+(defun file-body-limit (body)
+  (or (file-body-end body)
+      (with-open-file (in (file-body-pathname body)
+                          :element-type '(unsigned-byte 8))
+        (file-length in))))
+
+(defun file-body-count (body)
+  "Length of the span. A stored END does not open the file."
+  (max 0 (- (file-body-limit body) (file-body-start body))))
+
+(defun call-with-file-chunks (body function)
+  "Call FUNCTION with successive chunks covering BODY.
+A short read is an error: Content-Length was taken from this span."
+  (with-open-file (in (file-body-pathname body)
+                      :element-type '(unsigned-byte 8))
+    (let ((limit (or (file-body-end body) (file-length in)))
+          (pos (file-body-start body)))
+      (file-position in pos)
+      (loop while (< pos limit)
+            for want = (min *file-read-chunk* (- limit pos))
+            for chunk = (make-array want :element-type '(unsigned-byte 8))
+            for got = (read-sequence chunk in)
+            do (when (zerop got)
+                 (error "short read of ~a" (file-body-pathname body)))
+               (let ((piece (if (= got want) chunk (subseq chunk 0 got))))
+                 (funcall function piece)
+                 (incf pos (length piece))))
+      (unless (= pos limit)
+        (error "short read of ~a" (file-body-pathname body))))))
+
+(defun write-file-body (body stream)
+  (call-with-file-chunks body (lambda (chunk) (write-sequence chunk stream))))
+
+(defun read-file-span (body)
+  "The span as one vector. Multipart ranges and similar framing need the
+selected bytes; the identity send path does not call this."
+  (let ((chunks nil)
+        (size 0))
+    (call-with-file-chunks body
+                           (lambda (chunk)
+                             (incf size (length chunk))
+                             (push chunk chunks)))
+    (let ((out (make-array size :element-type '(unsigned-byte 8)))
+          (start 0))
+      (dolist (chunk (nreverse chunks))
+        (replace out chunk :start1 start)
+        (incf start (length chunk)))
+      out)))
+
 (defun response-octets (body)
   (cond ((null body) (ascii-octets ""))
         ((stringp body) (utf8-octets body))
@@ -695,6 +755,13 @@ HTTP/1.1 still frames that empty content with Content-Length: 0."
              (read-sequence buffer in)
              buffer)))
         (t nil)))
+
+(defun known-body-length (body)
+  "Octet length of a buffered body or a file span. NIL for a stream function."
+  (cond ((functionp body) nil)
+        ((file-body-p body) (file-body-count body))
+        (t (let ((octets (response-octets body)))
+             (and octets (length octets))))))
 
 (defun write-chunk (stream octets)
   (write-ascii stream (format nil "~X" (length octets)))
@@ -720,8 +787,11 @@ HTTP/1.1 still frames that empty content with Content-Length: 0."
                                              "proxy-connection" "content-length"
                                              "pazuzu-omit-length" "pazuzu-mixed")))
          (body (emitted-body response))
-         (known (response-octets body))
          (streaming (functionp body))
+         (file (and (file-body-p body) body))
+         (known (unless (or streaming file) (response-octets body)))
+         (body-length (cond (file (file-body-count file))
+                            (known (length known))))
          (send-body (and (status-has-body-p status) (not suppress-body))))
     (when (response-content-type response)
       (unless (header-value headers "content-type")
@@ -748,12 +818,11 @@ HTTP/1.1 still frames that empty content with Content-Length: 0."
                (not (header-value headers "date")))
       (push (cons "date" (format-imf-fixdate date)) headers))
     (let ((use-chunked (and send-body streaming (= version 11) (not close-connection))))
-      (when (and send-body (not streaming) (not omit-length)
+      (when (and (numberp body-length) (not streaming) (not omit-length)
+                 (status-has-body-p status)
+                 (or send-body suppress-body)
                  (not (header-value headers "content-length")))
-        (push (cons "content-length" (princ-to-string (length known))) headers))
-      (when (and suppress-body known (status-has-body-p status) (not omit-length)
-                 (not (header-value headers "content-length")))
-        (push (cons "content-length" (princ-to-string (length known))) headers))
+        (push (cons "content-length" (princ-to-string body-length)) headers))
       (when use-chunked
         (push (cons "transfer-encoding" "chunked") headers))
       (let ((must-close (or close-connection
@@ -806,6 +875,8 @@ HTTP/1.1 still frames that empty content with Content-Length: 0."
                           (lambda (octets)
                             (write-sequence (simple-octets octets) stream)
                             (finish-output stream))))
+                (file
+                 (write-file-body file stream))
                 (t
                  (write-sequence known stream))))
         (finish-output stream)
@@ -824,8 +895,7 @@ only the status code. Content-Length is omitted on 1xx and 204."
          (omit-length (header-value (response-headers response) "pazuzu-omit-length"))
          (headers (apply #'remove-headers (response-headers response) *hop-by-hop-headers*))
          (body (emitted-body response))
-         (streaming (functionp body))
-         (known (unless streaming (response-octets body))))
+         (body-length (known-body-length body)))
     (when (response-content-type response)
       (unless (header-value headers "content-type")
         (push (cons "content-type" (response-content-type response)) headers)))
@@ -846,9 +916,9 @@ only the status code. Content-Length is omitted on 1xx and 204."
       (push (cons "server" "pazuzu") headers))
     (when (and (<= 200 status 599) (not (header-value headers "date")))
       (push (cons "date" (format-imf-fixdate date)) headers))
-    (when (and known (status-has-body-p status) (not omit-length)
+    (when (and (numberp body-length) (status-has-body-p status) (not omit-length)
                (not (header-value headers "content-length")))
-      (push (cons "content-length" (princ-to-string (length known))) headers))
+      (push (cons "content-length" (princ-to-string body-length)) headers))
     (cons (cons ":status" (princ-to-string status))
           (nreverse
            (loop for (name . value) in (limit-qvalue-fields

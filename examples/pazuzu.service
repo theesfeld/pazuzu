@@ -1,0 +1,22 @@
+[Unit]
+Description=pazuzu origin server
+Requires=pazuzu.socket
+After=pazuzu.socket
+
+[Service]
+Type=simple
+# Enable pazuzu.socket. systemd sets LISTEN_PID, LISTEN_FDS, and
+# LISTEN_FDNAMES before this process starts. The config's :port is not
+# used for the adopted main listener. Run as the account that should own
+# the process; :user and :group in the config apply only when pazuzu
+# itself is still root.
+WorkingDirectory=/var/lib/pazuzu
+ExecStart=/usr/bin/sbcl --noinform --disable-debugger --load /var/lib/pazuzu/quicklisp/setup.lisp --eval "(asdf:load-asd \"/opt/pazuzu/pazuzu.asd\")" --eval "(ql:quickload :pazuzu)" --eval "(pazuzu:main)" -- /etc/pazuzu/config.lisp
+User=www-data
+Group=www-data
+# Drop this when script/build-deps.sh installed the libraries onto the default loader path.
+Environment=LD_LIBRARY_PATH=/usr/local/lib
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

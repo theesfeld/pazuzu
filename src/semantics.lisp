@@ -194,20 +194,23 @@ Range is defined only for GET. An unknown range unit is ignored."
                         :headers '(("accept-ranges" . "bytes"))
                         :body (build-multipart octets parsed boundary content-type)))))))
 
+(defun multipart-boundary-from (haystack &optional extra)
+  "A delimiter that does not occur in HAYSTACK or EXTRA (RFC 2046)."
+  (when (and extra (plusp (length extra))
+             (every (lambda (character) (<= (char-code character) 255)) extra))
+    (setf haystack (concatenate '(simple-array (unsigned-byte 8) (*))
+                                haystack (ascii-octets extra))))
+  (loop for attempt below 64
+        for boundary = (if (< attempt 8)
+                           (format nil "pazuzu~8,'0x" (random (ash 1 32)))
+                           (format nil "pazuzu~16,'0x~d" (random (ash 1 64)) attempt))
+        unless (search (ascii-octets boundary) haystack)
+          return boundary
+        finally (error "no multipart boundary is absent from the body")))
+
 (defun multipart-boundary (octets &optional extra)
   "A delimiter that does not occur in OCTETS or EXTRA (RFC 2046)."
-  (let ((haystack (simple-octets octets)))
-    (when (and extra (plusp (length extra))
-               (every (lambda (character) (<= (char-code character) 255)) extra))
-      (setf haystack (concatenate '(simple-array (unsigned-byte 8) (*))
-                                  haystack (ascii-octets extra))))
-    (loop for attempt below 64
-          for boundary = (if (< attempt 8)
-                             (format nil "pazuzu~8,'0x" (random (ash 1 32)))
-                             (format nil "pazuzu~16,'0x~d" (random (ash 1 64)) attempt))
-          unless (search (ascii-octets boundary) haystack)
-            return boundary
-          finally (error "no multipart boundary is absent from the body"))))
+  (multipart-boundary-from (simple-octets octets) extra))
 
 (defun concat-octets (pieces)
   (let* ((total (reduce #'+ pieces :key #'length :initial-value 0))
@@ -228,22 +231,71 @@ The line ends with CRLF (RFC 2046)."
       (format nil "Content-Type: ~a~c~c" content-type #\Return #\Newline)
       ""))
 
-(defun build-multipart (octets ranges boundary content-type)
-  "multipart/byteranges body. Delimiters and field lines end with CRLF (RFC 2046)."
+(defun build-multipart-parts (pieces ranges total boundary content-type)
+  "multipart/byteranges body. Delimiters and field lines end with CRLF (RFC 2046).
+PIECES are the selected ranges, in order. TOTAL is the full representation length."
   (let ((chunks nil)
         (type-line (multipart-type-line content-type)))
-    (dolist (range ranges)
-      (push (utf8-octets
-             (format nil "--~a~c~c~aContent-Range: bytes ~d-~d/~d~c~c~c~c"
-                     boundary #\Return #\Newline
-                     type-line
-                     (car range) (cdr range) (length octets)
-                     #\Return #\Newline #\Return #\Newline))
-            chunks)
-      (push (slice-octets octets (car range) (cdr range)) chunks)
-      (push (ascii-octets (format nil "~c~c" #\Return #\Newline)) chunks))
+    (loop for range in ranges
+          for piece in pieces
+          do (push (utf8-octets
+                    (format nil "--~a~c~c~aContent-Range: bytes ~d-~d/~d~c~c~c~c"
+                            boundary #\Return #\Newline
+                            type-line
+                            (car range) (cdr range) total
+                            #\Return #\Newline #\Return #\Newline))
+                   chunks)
+             (push piece chunks)
+             (push (ascii-octets (format nil "~c~c" #\Return #\Newline)) chunks))
     (push (utf8-octets (format nil "--~a--~c~c" boundary #\Return #\Newline)) chunks)
     (concat-octets (nreverse chunks))))
+
+(defun build-multipart (octets ranges boundary content-type)
+  "multipart/byteranges body. Delimiters and field lines end with CRLF (RFC 2046)."
+  (build-multipart-parts
+   (mapcar (lambda (range) (slice-octets octets (car range) (cdr range))) ranges)
+   ranges (length octets) boundary content-type))
+
+(defun file-range-slice (file range)
+  "FILE span covering RANGE, whose ends are inclusive offsets in the span.
+The copier is one argument on this SBCL, so the span is built by hand."
+  (make-file-body :pathname (file-body-pathname file)
+                  :start (+ (file-body-start file) (car range))
+                  :end (+ (file-body-start file) (cdr range) 1)))
+
+(defun apply-file-range (request file &key etag last-modified content-type)
+  "Like APPLY-RANGE for a file span. A single range stays a span, so the
+bytes outside it are not read. Multipart reads only the selected ranges."
+  (unless (and (string= (request-method request) "GET")
+               (request-header request "range"))
+    (return-from apply-file-range nil))
+  (unless (if-range-matches-p request :etag etag :last-modified last-modified)
+    (return-from apply-file-range nil))
+  (let* ((total (file-body-count file))
+         (parsed (parse-range-header (request-header request "range") total)))
+    (cond
+      ((or (eq parsed :ignore) (eq parsed :entire)) nil)
+      ((eq parsed :unsatisfiable)
+       (make-response :status 416
+                      :headers `(("content-range" . ,(format nil "bytes */~d" total)))
+                      :content-type "text/plain; charset=utf-8"
+                      :body "Range Not Satisfiable"))
+      ((null (rest parsed))
+       (let ((range (first parsed)))
+         (make-response :status 206
+                        :body (file-range-slice file range)
+                        :headers `(("content-range" . ,(format nil "bytes ~d-~d/~d"
+                                                               (car range) (cdr range) total))
+                                   ("accept-ranges" . "bytes")))))
+      (t
+       (let* ((pieces (mapcar (lambda (range)
+                                (read-file-span (file-range-slice file range)))
+                              parsed))
+              (boundary (multipart-boundary-from (concat-octets pieces) content-type)))
+         (make-response :status 206
+                        :content-type (format nil "multipart/byteranges; boundary=~a" boundary)
+                        :headers '(("accept-ranges" . "bytes"))
+                        :body (build-multipart-parts pieces parsed total boundary content-type)))))))
 
 (defun media-type-main (content-type)
   (string-trim '(#\Space #\Tab)

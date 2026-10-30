@@ -400,9 +400,14 @@ because a shorter list would omit a method the resource still allows."
       (return-from finalize-response response)))
   (unless (<= 200 (response-status response) 299)
     (return-from finalize-response response))
-  (let* ((octets (body-octets (response-body response)))
-         (streaming (functionp (response-body response)))
-         (range-wanted (and octets
+  (let* ((raw (response-body response))
+         (streaming (functionp raw))
+         (file (and (file-body-p raw) raw))
+         (octets (unless (or streaming file) (body-octets raw)))
+         (span (cond (octets (length octets))
+                     (file (file-body-count file))))
+         ;; SPAN is a length, including zero. A missing body has no span.
+         (range-wanted (and (numberp span)
                             (member (request-method request) '("GET" "HEAD")
                                     :test #'string=)
                             (request-header request "range")
@@ -412,24 +417,25 @@ because a shorter list would omit a method the resource still allows."
                    ;; that mixes confidential and attacker-controlled
                    ;; data is not content-coded. One source still is.
                    (mixed 'identity)
-                   ((and octets (not streaming))
+                   ((and span (not streaming))
                     (choose-content-coding request
                                            (response-content-type response)
-                                           (length octets)
+                                           span
                                            :prefer-identity range-wanted))
                    (t 'identity))))
     (when (and (eq coding :none) range-wanted)
       (setf coding (choose-content-coding request
                                           (response-content-type response)
-                                          (length octets)
+                                          span
                                           :prefer-identity nil)
             range-wanted nil))
     ;; Not a 2xx. Preconditions are ignored (RFC 9110 §13.2.1).
     (when (eq coding :none)
       (return-from finalize-response (plain-error 406)))
-    (let ((encoded (if (eq coding 'identity)
-                       octets
-                       (encode-body octets coding))))
+    (let ((encoded (cond
+                     ((eq coding 'identity) octets)
+                     (file (encode-file-body file coding))
+                     (t (encode-body octets coding)))))
       ;; A strong tag for the uncoded bytes is not a validator for a
       ;; different content coding (RFC 9110 §8.8.1). The encoded octets
       ;; are known here, so their hash is a strong validator.
@@ -472,14 +478,21 @@ because a shorter list would omit a method the resource still allows."
                    (append (response-headers failed) (response-headers response)))
              (return-from finalize-response failed)))))
       (when (and range-wanted (string= (request-method request) "GET"))
-        (let ((ranged (apply-range request octets
-                                   :etag (response-etag response)
-                                   :last-modified (response-last-modified response)
-                                   :content-type (response-content-type response))))
+        (let ((ranged (if (and file (eq coding 'identity))
+                          (apply-file-range request file
+                                            :etag (response-etag response)
+                                            :last-modified (response-last-modified response)
+                                            :content-type (response-content-type response))
+                          (apply-range request octets
+                                       :etag (response-etag response)
+                                       :last-modified (response-last-modified response)
+                                       :content-type (response-content-type response)))))
           (when ranged
-            (setf response (partial-response request response ranged)
-                  octets (body-octets (response-body ranged))
-                  coding 'identity))))
+            (setf response (partial-response request response ranged))
+            (let ((body (response-body response)))
+              (setf octets (if (file-body-p body) nil (body-octets body))
+                    file (and (file-body-p body) body)
+                    coding 'identity)))))
       ;; RFC 9110 §14.2 defines range handling for GET only, so HEAD ignores
       ;; Range. RFC 9110 §8.6 forbids a Content-Length that is not the number
       ;; of octets GET would have sent for this same request. When those
@@ -488,15 +501,20 @@ because a shorter list would omit a method the resource still allows."
       (when (and range-wanted (string= (request-method request) "HEAD"))
         (let* ((as-get (make-request :method "GET"
                                      :headers (request-headers request)))
-               (ranged (apply-range as-get octets
-                                    :etag (response-etag response)
-                                    :last-modified (response-last-modified response)
-                                    :content-type (response-content-type response)))
-               (got (and ranged (body-octets (response-body ranged)))))
+               (ranged (if file
+                           (apply-file-range as-get file
+                                             :etag (response-etag response)
+                                             :last-modified (response-last-modified response)
+                                             :content-type (response-content-type response))
+                           (apply-range as-get octets
+                                        :etag (response-etag response)
+                                        :last-modified (response-last-modified response)
+                                        :content-type (response-content-type response))))
+               (got (and ranged (known-body-length (response-body ranged)))))
           (when (and ranged
                      (not (and (= (response-status ranged) 206)
                                got
-                               (= (length got) (length octets)))))
+                               (= got span))))
             ;; The body stays the selected representation so the connection
             ;; is not closed the way a streamed body is. The writers drop
             ;; this field and do not emit Content-Length.
@@ -505,15 +523,16 @@ because a shorter list would omit a method the resource still allows."
                   coding 'identity))))
       (unless (eq coding 'identity)
         (setf octets encoded
+              file nil
               (response-headers response)
               (add-vary (acons "content-encoding" (string-downcase (string coding))
                                (remove-headers (response-headers response) "content-encoding"))
                         "accept-encoding")))
-      (when (and octets (= (response-status response) 200)
+      (when (and (or octets file) (= (response-status response) 200)
                  (not (header-value (response-headers response) "accept-ranges")))
         (setf (response-headers response)
               (acons "accept-ranges" "bytes" (response-headers response))))
-      (unless streaming
+      (unless (or streaming file)
         (setf (response-body response) octets))
       response))))
 
@@ -833,8 +852,8 @@ finish with the status the method and target already decide."
               (error 'end-of-request)))))))
 
 (defun response-byte-count (response)
-  (let ((octets (and response (response-octets (emitted-body response)))))
-    (and octets (length octets))))
+  (when response
+    (known-body-length (emitted-body response))))
 
 (defun request-line (request)
   (if request
@@ -1843,12 +1862,6 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
              (directory-child root (merge-pathnames "index.html" candidate)))
             (candidate candidate)))))
 
-(defun read-file-octets (pathname)
-  (with-open-file (in pathname :element-type '(unsigned-byte 8))
-    (let ((buffer (make-array (file-length in) :element-type '(unsigned-byte 8))))
-      (read-sequence buffer in)
-      buffer)))
-
 (defun static-validator (root prefix request)
   "Return (mtime . length) for the file this request selects, or NIL.
 The body is not read. A false If-None-Match can be decided from this
@@ -1871,8 +1884,13 @@ pair before the method (RFC 9110 §13.1.2)."
         (validator (static-validator root prefix request)))
     (unless (and file validator)
       (return-from static-response (plain-error 404)))
+    ;; END is the length the validator already observed, so the body,
+    ;; Content-Length, and the weak etag describe the same span. The
+    ;; send path reads that span in chunks.
     (make-response :status 200
-                   :body (read-file-octets file)
+                   :body (make-file-body :pathname file
+                                         :start 0
+                                         :end (cdr validator))
                    :content-type (mime-type file)
                    :etag (static-etag (car validator) (cdr validator))
                    :last-modified (car validator)
