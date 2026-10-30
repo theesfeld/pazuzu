@@ -76,8 +76,30 @@ A path that is now NIL closes that log."
              character))
        text))
 
+(defvar *log-level* :notice
+  "notice writes notice and error. error writes only error.")
+
+(defvar *access-on-stdout* nil
+  "When true, access lines are also written to standard output for journald.")
+
+(defun set-log-level (name)
+  "NAME is notice or error."
+  (cond ((member name '("notice" "info") :test #'string-equal)
+         (setf *log-level* :notice))
+        ((string-equal name "error")
+         (setf *log-level* :error))
+        (t (error "unknown log level ~a (expected notice or error)" name))))
+
+(defun log-level-enabled-p (level)
+  (or (string-equal level "error")
+      (eq *log-level* :notice)))
+
 (defun error-log (logger level control &rest args)
-  "Write one error-log line. LEVEL is a short word such as \"error\"."
+  "Write one error-log line. LEVEL is a short word such as \"error\".
+The line goes to the error stream so journald records it. A notice line
+is skipped when the log level is error."
+  (unless (log-level-enabled-p level)
+    (return-from error-log nil))
   (let ((text (one-log-line (format nil "~a [~a] ~a"
                                     (iso-timestamp)
                                     level
@@ -125,15 +147,17 @@ A path that is now NIL closes that log."
 
 (defun access-log (logger &key peer request status bytes referer user-agent time)
   "Write one line in the Combined Log Format."
-  (when (and logger (logger-access-stream logger))
-    (let ((line (format nil "~a - - ~a \"~a\" ~d ~a \"~a\" \"~a\""
-                        (or peer "-")
-                        (access-time (or time (get-universal-time)))
-                        (log-quote request)
-                        status
-                        (if bytes (princ-to-string bytes) "-")
-                        (log-quote (or referer "-"))
-                        (log-quote (or user-agent "-")))))
+  (let ((line (format nil "~a - - ~a \"~a\" ~d ~a \"~a\" \"~a\""
+                      (or peer "-")
+                      (access-time (or time (get-universal-time)))
+                      (log-quote request)
+                      status
+                      (if bytes (princ-to-string bytes) "-")
+                      (log-quote (or referer "-"))
+                      (log-quote (or user-agent "-")))))
+    (when *access-on-stdout*
+      (write-log-line *standard-output* line))
+    (when (and logger (logger-access-stream logger))
       (bt:with-lock-held ((logger-lock logger))
         (ignore-errors (write-log-line (logger-access-stream logger) line))))))
 

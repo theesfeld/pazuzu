@@ -81,16 +81,16 @@ build_openssl() {
   cd "openssl-$ver"
   ./Configure "linux-$(uname -m)" shared \
     --prefix="$PREFIX" --libdir=lib --openssldir="$PREFIX/ssl" \
-    -Wl,-rpath,"$PREFIX/lib"
+    -Wl,-rpath,'$ORIGIN'
   make -j"$JOBS"
   make install_sw
   # install_sw omits openssl.cnf. The openssl CLI, including the one the
   # test suite uses to mint certificates, reads it from this prefix.
   make install_ssldirs
   cd "$SRC"
-  # Later libraries and curl must find this OpenSSL at build time and
-  # at load time. CFFI dlopen follows the same rpath on libngtcp2_crypto_ossl.
-  export LDFLAGS="-Wl,-rpath,${PREFIX}/lib ${LDFLAGS:-}"
+  # $ORIGIN keeps a copied lib directory working after make install moves it.
+  # CFFI dlopen of libngtcp2_crypto_ossl then finds libssl beside it.
+  export LDFLAGS="-Wl,-rpath,\$ORIGIN ${LDFLAGS:-}"
   export CPPFLAGS="-I${PREFIX}/include ${CPPFLAGS:-}"
 }
 

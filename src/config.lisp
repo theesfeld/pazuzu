@@ -380,6 +380,133 @@ reopen the logs, and load the certificate chain again."
   (reload-certificates server)
   server)
 
+(defparameter +pazuzu-version+ "0.1.0")
+
+(defvar *shutdown-drain-seconds* 2)
+
+(defparameter *usage*
+  "Usage: pazuzu --config PATH [--log-level notice|error]
+       pazuzu --check-config PATH
+       pazuzu --version
+
+--config PATH        Configuration file. A bare path is also accepted.
+--check-config PATH  Read the file and exit. No sockets are opened.
+--version            Print the version and exit.
+--log-level LEVEL    notice (default) or error. error hides notice lines.
+--help               Print this text and exit.
+
+SIGINT and SIGTERM stop accepting, drain in-flight connections, then exit.
+SIGHUP reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics
+token, the certificate chain, and the file mappings. The listen address,
+ports, backlog, and the process account stay as they were at start.
+Restart the process to change those.
+")
+
+(defun pazuzu-init-library-path ()
+  "Search the install lib directory before foreign libraries are reopened.
+The directory sits next to the executable: ../lib/pazuzu."
+  (let* ((runtime sb-ext:*runtime-pathname*)
+         (dir (ignore-errors
+                (merge-pathnames "../lib/pazuzu/"
+                                 (make-pathname :directory (pathname-directory
+                                                            (truename runtime)))))))
+    (when (and dir (probe-file dir))
+      (pushnew dir cffi:*foreign-library-directories* :test #'equal))))
+
+(pushnew 'pazuzu-init-library-path sb-ext:*init-hooks*)
+
+(cffi:defcfun ("socket" %notify-socket) :int
+  (domain :int) (type :int) (protocol :int))
+
+(cffi:defcfun ("sendto" %notify-sendto) :long
+  (fd :int) (buffer :pointer) (length :unsigned-long) (flags :int)
+  (address :pointer) (address-length :unsigned-int))
+
+(defun sd-notify (state)
+  "Tell systemd the service state when NOTIFY_SOCKET is set.
+The message is one datagram, which is the sd_notify protocol. A missing
+variable does nothing, so a process started by hand is unchanged."
+  (let ((name (sb-ext:posix-getenv "NOTIFY_SOCKET")))
+    (unless (and name (plusp (length name)))
+      (return-from sd-notify nil))
+    (let* ((abstract (char= (char name 0) #\@))
+           (path (if abstract (subseq name 1) name))
+           (fd (%notify-socket 1 2 0)))
+      (when (< fd 0)
+        (return-from sd-notify nil))
+      (unwind-protect
+           (cffi:with-foreign-object (addr :uint8 110)
+             (foreign-zero addr 110)
+             (setf (cffi:mem-ref addr :uint16) 1)
+             (if abstract
+                 (setf (cffi:mem-ref addr :uint8 2) 0)
+                 nil)
+             (loop for index below (min (length path) 100)
+                   for byte = (char-code (char path index))
+                   do (setf (cffi:mem-ref addr :uint8
+                                          (+ index (if abstract 3 2)))
+                            byte))
+             (let* ((octets (babel:string-to-octets state :encoding :utf-8))
+                    (addrlen (if abstract
+                                 (+ 3 (length path))
+                                 (+ 2 (length path) 1))))
+               (cffi:with-pointer-to-vector-data (pointer octets)
+                 (%notify-sendto fd pointer (length octets) 0 addr addrlen))))
+        (ignore-errors (posix-close fd))))))
+
+(defun check-config-file (path)
+  "Read PATH and reject a bad key or a bad file mapping. No socket is opened."
+  (let ((plist (read-config path)))
+    (check-config-keys plist)
+    (start-arguments plist)
+    (let ((base (if (plist-key-p plist :root)
+                    (file-root-pathname (getf plist :root))
+                    (default-file-root))))
+      (when (plist-key-p plist :directories)
+        (directory-config-routes (getf plist :directories) base))
+      (when (plist-key-p plist :hosts)
+        (host-config-routes (getf plist :hosts) base)))
+    t))
+
+(defun parse-command (argv)
+  "Plist of :config :check :version :help :log-level from ARGV."
+  (let ((config nil)
+        (check nil)
+        (version nil)
+        (help nil)
+        (level nil))
+    (loop for rest = argv then (cdr rest)
+          while rest
+          for arg = (first rest)
+          do (cond
+               ((or (string= arg "--help") (string= arg "-h"))
+                (setf help t))
+               ((string= arg "--version")
+                (setf version t))
+               ((string= arg "--config")
+                (unless (second rest)
+                  (error "missing path after --config~%~a" *usage*))
+                (setf config (second rest)
+                      rest (cdr rest)))
+               ((string= arg "--check-config")
+                (setf check t)
+                (when (and (second rest)
+                           (plusp (length (second rest)))
+                           (char/= (char (second rest) 0) #\-))
+                  (setf config (second rest)
+                        rest (cdr rest))))
+               ((string= arg "--log-level")
+                (unless (second rest)
+                  (error "missing level after --log-level~%~a" *usage*))
+                (setf level (second rest)
+                      rest (cdr rest)))
+               ((and (plusp (length arg)) (char/= (char arg 0) #\-))
+                (when config
+                  (error "unexpected argument ~a~%~a" arg *usage*))
+                (setf config arg))
+               (t (error "unknown argument ~a~%~a" arg *usage*))))
+    (list :config config :check check :version version :help help :log-level level)))
+
 (defun install-signals ()
   (unless *signals-installed*
     (setf *signals-installed* t)
@@ -423,18 +550,41 @@ sets a flag."
 
 (defun main (&optional (argv (rest sb-ext:*posix-argv*)))
   "Run the server in the foreground from a configuration file.
-SIGINT and SIGTERM stop it. SIGHUP reloads certificates, logs, and the
-runtime keys in the file."
-  (let ((path (command-config-path argv)))
-    (unless path
-      (error "Usage: pazuzu CONFIG-FILE"))
-    (setf *shutdown-flag* nil)
-    (let ((server (start-from-config path)))
-      (enable-reload server)
-      (error-log (server-logger server) "notice"
-                 "listening on ~a port ~d with ~d workers"
-                 (server-address server) (server-port server) (worker-count server))
-      (unwind-protect
-           (loop until *shutdown-flag*
-                 do (sleep 0.2))
-        (stop server)))))
+--check-config and --version do not listen. SIGINT and SIGTERM drain
+connections and stop the process. SIGHUP reloads the runtime keys."
+  (let ((command (parse-command argv)))
+    (when (getf command :log-level)
+      (set-log-level (getf command :log-level)))
+    (cond
+      ((getf command :help)
+       (write-string *usage* *standard-output*)
+       (finish-output *standard-output*))
+      ((getf command :version)
+       (format t "pazuzu ~a~%" +pazuzu-version+)
+       (finish-output *standard-output*))
+      ((getf command :check)
+       (let ((path (getf command :config)))
+         (unless path
+           (error "missing configuration path~%~a" *usage*))
+         (check-config-file path)
+         (format t "configuration ok~%")
+         (finish-output *standard-output*)))
+      (t
+       (let ((path (getf command :config)))
+         (unless path
+           (error "missing configuration path~%~a" *usage*))
+         (setf *shutdown-flag* nil
+               *shutdown-drain-seconds* 10
+               *access-on-stdout* t)
+         (let ((server (start-from-config path)))
+           (enable-reload server)
+           (error-log (server-logger server) "notice"
+                      "listening on ~a port ~d with ~d workers"
+                      (server-address server) (server-port server)
+                      (worker-count server))
+           (sd-notify "READY=1")
+           (unwind-protect
+                (loop until *shutdown-flag*
+                      do (sleep 0.2))
+             (sd-notify "STOPPING=1")
+             (stop server :drain-seconds *shutdown-drain-seconds*))))))))

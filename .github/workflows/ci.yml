@@ -22,7 +22,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential autoconf automake libtool pkg-config cmake \
             ca-certificates curl xz-utils python3 python3-venv python3-pip \
-            sbcl zlib1g-dev perl nodejs
+            sbcl zlib1g-dev perl nodejs patchelf
 
       - name: Cache native libraries
         uses: actions/cache@v4
@@ -86,3 +86,8 @@ jobs:
           done
           test "$ready" = 1
           /tmp/h2spec -h 127.0.0.1 -p 18080 -o 5
+
+      - name: Build the binary and smoke-test a DESTDIR install
+        run: |
+          ./script/build-binary.sh
+          ./script/smoke-install.sh

@@ -1,0 +1,15 @@
+[Unit]
+Description=pazuzu HTTP sockets
+
+[Socket]
+# systemd binds these as root and passes the descriptors. The service
+# runs unprivileged. BindIPv6Only=both accepts IPv4 on the IPv6 sockets.
+BindIPv6Only=both
+ListenStream=[::]:80
+ListenStream=[::]:443
+ListenDatagram=[::]:443
+FileDescriptorName=http:https:quic
+Service=pazuzu.service
+
+[Install]
+WantedBy=sockets.target

@@ -1,22 +1,43 @@
 [Unit]
 Description=pazuzu origin server
+Documentation=https://github.com/theesfeld/pazuzu
 Requires=pazuzu.socket
-After=pazuzu.socket
+After=pazuzu.socket network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
-# Enable pazuzu.socket. systemd sets LISTEN_PID, LISTEN_FDS, and
-# LISTEN_FDNAMES before this process starts. The config's :port is not
-# used for the adopted main listener. Run as the account that should own
-# the process; :user and :group in the config apply only when pazuzu
-# itself is still root.
+Type=notify
+NotifyAccess=main
+User=pazuzu
+Group=pazuzu
+ExecStart=/usr/local/bin/pazuzu --config /etc/pazuzu/config.lisp
+Restart=on-failure
+RestartSec=1
 WorkingDirectory=/var/lib/pazuzu
-ExecStart=/usr/bin/sbcl --noinform --disable-debugger --load /var/lib/pazuzu/quicklisp/setup.lisp --eval "(asdf:load-asd \"/opt/pazuzu/pazuzu.asd\")" --eval "(ql:quickload :pazuzu)" --eval "(pazuzu:main)" -- /etc/pazuzu/config.lisp
-User=www-data
-Group=www-data
-# Drop this when script/build-deps.sh installed the libraries onto the default loader path.
-Environment=LD_LIBRARY_PATH=/usr/local/lib
+StateDirectory=pazuzu
+LogsDirectory=pazuzu
+Environment=LD_LIBRARY_PATH=/usr/local/lib/pazuzu
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# SBCL writes executable code pages. Denying that stops the process.
+MemoryDenyWriteExecute=false
+ReadOnlyPaths=/etc/pazuzu
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

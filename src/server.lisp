@@ -1407,6 +1407,26 @@ initgroups runs only as root. A later setuid cannot regain that uid."
         (cffi:mem-ref value :int)
         2)))
 
+(defun socket-datagram-p (fd)
+  "SO_TYPE is 3 and SOCK_DGRAM is 2."
+  (cffi:with-foreign-objects ((value :int) (length :unsigned-int))
+    (setf (cffi:mem-ref length :unsigned-int) (cffi:foreign-type-size :int))
+    (and (zerop (%getsockopt fd 1 3 value length))
+         (= (cffi:mem-ref value :int) 2))))
+
+(defun udp-socket-from-fd (fd)
+  "Adopt a bound UDP socket and apply the same DF and ECN settings as HTTP/3."
+  (let* ((ipv6 (= (fd-domain fd) 10))
+         (socket (make-instance (if ipv6
+                                    'sb-bsd-sockets:inet6-socket
+                                    'sb-bsd-sockets:inet-socket)
+                                :type :datagram :protocol :udp :descriptor fd)))
+    (set-udp-dont-fragment fd ipv6)
+    (unless (set-udp-recv-ecn fd ipv6)
+      (error "could not receive ECN marks"))
+    (set-nonblock fd)
+    socket))
+
 (defun listener-from-fd (fd)
   "Adopt a listening socket. Linux accept does not copy O_NONBLOCK, and
 sd_listen_fds sets FD_CLOEXEC on the passed descriptors."
@@ -1426,45 +1446,62 @@ sd_listen_fds sets FD_CLOEXEC on the passed descriptors."
           while colon)))
 
 (defun take-activated-listeners ()
-  "Systemd socket activation (sd_listen_fds). Returns the main, metrics, and
-redirect listeners when LISTEN_PID is this process. The LISTEN_* environment
-is cleared so a child does not claim the same descriptors. FileDescriptorName
-values http, https, and web are the main listener. metrics and redirect select
-the other two. With no names, the first descriptor is the main listener."
+  "Systemd socket activation (sd_listen_fds). Returns the main TCP listener,
+the metrics listener, the redirect listener, and an adopted UDP socket.
+LISTEN_* is cleared so a child does not claim the same descriptors.
+
+FileDescriptorName values: https is the TLS listener. http is that listener
+when no https socket was passed, and the cleartext redirect when https was.
+redirect is the cleartext listener. web, an empty name, or a missing name is
+the main listener, which keeps a single unnamed socket working. metrics is
+the Prometheus listener. A datagram socket (quic, http3, or any other name)
+is the HTTP/3 socket. With no names, the first stream socket is the main
+listener."
   (let ((pid-text (sb-ext:posix-getenv "LISTEN_PID"))
         (count-text (sb-ext:posix-getenv "LISTEN_FDS")))
     (unless (and pid-text count-text
                  (string= pid-text (princ-to-string (sb-posix:getpid))))
-      (return-from take-activated-listeners (values nil nil nil)))
+      (return-from take-activated-listeners (values nil nil nil nil)))
     (let ((count (parse-integer count-text :junk-allowed t))
           (names (split-colon-names (sb-ext:posix-getenv "LISTEN_FDNAMES")))
-          (main nil)
+          (streams nil)
           (metrics nil)
-          (redirect nil))
+          (quic nil))
       (sb-posix:unsetenv "LISTEN_PID")
       (sb-posix:unsetenv "LISTEN_FDS")
       (sb-posix:unsetenv "LISTEN_FDNAMES")
       (sb-posix:unsetenv "LISTEN_PIDFDID")
       (unless (and count (plusp count))
-        (return-from take-activated-listeners (values nil nil nil)))
+        (return-from take-activated-listeners (values nil nil nil nil)))
       (loop for index below count
             for fd = (+ 3 index)
-            for name = (nth index names)
-            for listener = (listener-from-fd fd)
-            do (cond ((member name '("metrics") :test #'string=)
-                      (setf metrics listener))
-                     ((member name '("redirect") :test #'string=)
-                      (setf redirect listener))
-                     ((or (null name) (string= name "")
-                          (member name '("http" "https" "web") :test #'string=))
-                      (if main
-                          (ignore-errors (usocket:socket-close listener))
-                          (setf main listener)))
+            for name = (or (nth index names) "")
+            do (cond ((socket-datagram-p fd)
+                      (if quic
+                          (ignore-errors (posix-close fd))
+                          (setf quic (udp-socket-from-fd fd))))
+                     ((string= name "metrics")
+                      (let ((listener (listener-from-fd fd)))
+                        (if metrics
+                            (ignore-errors (usocket:socket-close listener))
+                            (setf metrics listener))))
                      (t
-                      (if main
-                          (ignore-errors (usocket:socket-close listener))
-                          (setf main listener)))))
-      (values main metrics redirect))))
+                      (push (cons name (listener-from-fd fd)) streams))))
+      (setf streams (nreverse streams))
+      (let* ((https (cdr (assoc "https" streams :test #'string=)))
+             (http (cdr (assoc "http" streams :test #'string=)))
+             (named-redirect (cdr (assoc "redirect" streams :test #'string=)))
+             (main (or https
+                       http
+                       (cdr (assoc "web" streams :test #'string=))
+                       (cdr (assoc "" streams :test #'string=))
+                       (cdr (first streams))))
+             (redirect (or named-redirect
+                           (and https http))))
+        (dolist (pair streams)
+          (unless (or (eq (cdr pair) main) (eq (cdr pair) redirect))
+            (ignore-errors (usocket:socket-close (cdr pair)))))
+        (values main metrics redirect quic)))))
 
 (defun parse-ipv4-host (text)
   "Four decimal octets, 0-255, with no leading zero. NIL otherwise."
@@ -1704,7 +1741,7 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
         (progn
           (when https
             (remember-certificate-names server certificate))
-          (multiple-value-bind (given-main given-metrics given-redirect)
+          (multiple-value-bind (given-main given-metrics given-redirect given-quic)
               (take-activated-listeners)
             (let* ((listener (or given-main
                                  (listen-socket address port :backlog backlog)))
@@ -1713,11 +1750,16 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
                     (server-main-listener server) listener
                     (server-main-tls server) https)
               (push listener (server-listeners server))
+              (when (and given-quic (not https))
+                (ignore-errors (sb-bsd-sockets:socket-close given-quic))
+                (error "an activated HTTP/3 socket requires a certificate"))
               (when https
                 (setf (server-https-port server) (server-port server)
                       (server-h3-context server) (make-h3-context certificate private-key)
                       (server-quic-socket server)
-                      (http3-bind (usocket:get-local-address listener) (server-port server))))
+                      (or given-quic
+                          (http3-bind (usocket:get-local-address listener)
+                                      (server-port server)))))
               (when (and given-redirect (not https))
                 (error "redirect requires an HTTPS listener."))
               (when (or redirect-port given-redirect)
@@ -1747,8 +1789,10 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
         (stop server)
         (error condition)))))
 
-(defun stop (server)
-  "GOAWAY HTTP/2, close HTTP/3 with H3_NO_ERROR, then close sockets and join."
+(defun stop (server &key (drain-seconds 2))
+  "Stop listeners, let in-flight work finish, then close what remains.
+HTTP/2 is told GOAWAY and HTTP/3 is closed with H3_NO_ERROR. DRAIN-SECONDS
+is how long those connections may take to leave before the sockets are shut."
   (let ((endpoint (server-endpoint server)))
     (when endpoint
       (setf (h3-endpoint-draining endpoint) t)
@@ -1759,11 +1803,15 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
     (dolist (conn (bt:with-lock-held ((server-lock server))
                     (copy-list (server-h2-conns server))))
       (eventfd-write (h2-conn-wake conn)))
+    (when (and (> drain-seconds 2) (server-logger server))
+      (error-log (server-logger server) "notice" "draining connections"))
     (wait-for (lambda ()
                 (and (null (bt:with-lock-held ((server-lock server))
-                              (server-h2-conns server)))
+                              (copy-list (server-clients server))))
+                     (null (bt:with-lock-held ((server-lock server))
+                             (server-h2-conns server)))
                      (or (null endpoint) (h3-endpoint-drained endpoint))))
-              2))
+              drain-seconds))
   ;; shutdown wakes a peer blocked in poll. close() from another thread
   ;; does not, on Linux, so join would wait out the read deadline.
   (dolist (client (copy-list (server-clients server)))
