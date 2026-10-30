@@ -101,7 +101,7 @@ pazuzu --version
 pazuzu --log-level error --config /etc/pazuzu/config.lisp
 ```
 
-`SIGINT` and `SIGTERM` stop accepting, tell HTTP/2 and HTTP/3 to close, wait for in-flight connections, then exit. `SIGHUP` reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics token, the heap limit, the certificate chain, and the file mappings. The listen address, ports, backlog, and account do not change on reload; restart the service to change those. `SIGUSR2` hands the listening sockets to a new copy of this program (`script/handoff.sh`) and then drains.
+`SIGINT` and `SIGTERM` stop accepting, tell HTTP/2 and HTTP/3 to close, wait for in-flight connections, then exit. `SIGHUP` reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics token, the heap limit, the certificate chain, and the file mappings. The listen address, ports, backlog, and account do not change on reload; restart the service to change those. `SIGUSR2` hands the listening sockets to a new copy of this program (`script/handoff.py`) and then drains.
 
 ## Load from Lisp
 
