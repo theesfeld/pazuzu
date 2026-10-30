@@ -1,0 +1,13 @@
+[Unit]
+Description=pazuzu HTTP socket
+
+[Socket]
+# Loopback, matching examples/config.lisp. systemd passes this descriptor
+# as LISTEN_FDS with the name below. pazuzu adopts it and does not bind :port.
+ListenStream=127.0.0.1:8080
+FileDescriptorName=http
+# A second ListenStream named "metrics" or "redirect" is adopted as that role.
+# Leave metrics off here unless the config sets a token. See examples/config.lisp.
+
+[Install]
+WantedBy=sockets.target

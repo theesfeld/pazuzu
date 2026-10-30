@@ -1,7 +1,7 @@
 # Conformance tracker
 
 Issue list for this origin against RFC 9110, RFC 9112, RFC 9113, RFC 9114, RFC 9000, RFC 9204, and RFC 6455.
-A sentence is met when a check in `t/run.lisp`, or a case in h2spec, fails if that behavior breaks.
+A sentence is met when a check in the files under `t/`, or a case in h2spec, fails if that behavior breaks. `t/run.lisp` is the entry point `asdf:test-system` calls.
 A sentence in this file or in `README.md` is not that check.
 
 Date of this pass: 2026-10-29.
@@ -25,9 +25,9 @@ The old "882 of 882" figure counted a paragraph as met when the code, the README
 
 ## Sentence execution
 
-Counted from the RFC text on 2026-10-28, then checked against `t/run.lisp` and the h2spec log on 2026-10-29. A section number missing from `t/run.lisp` is not proof the sentence is untested. h2spec is a separate program and does not appear in that file.
+Counted from the RFC text on 2026-10-28, then checked against the files under `t/` and the h2spec log on 2026-10-29. A section number missing from those files is not proof the sentence is untested. h2spec is a separate program and does not appear in that file.
 
-| RFC | Sentences | Normative (MUST / MUST NOT / REQUIRED / SHALL) | Normative whose section number is absent from `t/run.lisp` |
+| RFC | Sentences | Normative (MUST / MUST NOT / REQUIRED / SHALL) | Normative whose section number is absent from the files under `t/` |
 | --- | --- | --- | --- |
 | 9110 | 2187 | 198 | 57 |
 | 9112 | 480 | 83 | 8 |
@@ -42,7 +42,7 @@ The 182 are listed with a disposition below. None of them is a new open issue. O
 
 ### Already executed, under another check name
 
-The section string is absent from `t/run.lisp`. The check still fails if the behavior breaks.
+The section string is absent from the files under `t/`. The check still fails if the behavior breaks.
 
 | Sentence | Check |
 | --- | --- |

@@ -6,17 +6,57 @@ Run it from Lisp, or start it in the foreground from a configuration file. The f
 
 ## Requirements
 
+- Linux x86_64
 - [SBCL](https://www.sbcl.org/)
 - [Quicklisp](https://www.quicklisp.org/)
-- OpenSSL (`libssl`), used for TLS through `cl+ssl`
+- OpenSSL 3.5 or newer (`libssl`), used for TLS through `cl+ssl` and for `libngtcp2_crypto_ossl`
 - `libnghttp2` 1.70.0 (`#x014600`)
 - `libngtcp2` and `libngtcp2_crypto_ossl` 1.25.0 (`#x011900`)
 - `libnghttp3` 1.18.0 (`#x011200`)
 - `libbrotlienc`, `libbrotlidec`, and `libzstd` for `br` and `zstd`
 
-A different `version_num` from nghttp2, ngtcp2, or nghttp3 is refused at load. HTTP/3 uses the OpenSSL crypto backend (`libngtcp2_crypto_ossl`).
+A different `version_num` from nghttp2, ngtcp2, or nghttp3 is refused at load. HTTP/3 uses the OpenSSL crypto backend (`libngtcp2_crypto_ossl`), not the GnuTLS one. Distro packages are often older, or built against GnuTLS, and then `ql:quickload` fails the version check.
 
-Quicklisp systems: alexandria, babel, bordeaux-threads, cffi, chipz, cl-base64, cl+ssl, ironclad, salza2, usocket.
+Quicklisp systems: alexandria, babel, bordeaux-threads, cffi, cffi-libffi, chipz, cl-base64, cl+ssl, ironclad, salza2, usocket. `cffi-libffi` calls `nghttp3_rcbuf_get_buf`, which returns a 16-byte struct by value. The first load compiles a small probe, so a C compiler has to be installed.
+
+## Platform
+
+pazuzu is written for Linux on x86_64 and for SBCL.
+
+- `struct msghdr`, `struct cmsghdr`, and `struct iovec` follow the Linux x86_64 System V layout, including the padding after `msg_namelen`. Load fails when CFFI lays those structs out differently.
+- `eventfd`, `poll`, and `__errno_location` are the Linux C library. `EAGAIN` is 11 and `EINTR` is 4.
+- Socket activation reads systemd's `LISTEN_PID`, `LISTEN_FDS`, and `LISTEN_FDNAMES`.
+
+## Native libraries
+
+`script/build-deps.sh` builds and installs the pinned versions. The default prefix is `/usr/local`. A matching stamp under that prefix skips a second build.
+
+| Library | Version |
+| --- | --- |
+| OpenSSL | 3.5.9 |
+| nghttp2 | 1.70.0 |
+| ngtcp2 | 1.25.0, including `libngtcp2_crypto_ossl` |
+| nghttp3 | 1.18.0 |
+| brotli | 1.1.1 |
+| zstd | 1.5.7 |
+| curl | 8.23.0, with HTTP/3, brotli, and zstd, for the test suite |
+
+```sh
+sudo PREFIX=/usr/local ./script/build-deps.sh
+```
+
+When the script is not run as root it prints the `PATH` and `LD_LIBRARY_PATH` to export. `PREFIX=/opt/pazuzu ./script/build-deps.sh` installs into a directory you can write.
+
+The same build is the Docker image. From the clone directory:
+
+```sh
+docker build -t pazuzu-deps .
+docker run --rm -v "$PWD":/src -w /src pazuzu-deps \
+  sbcl --noinform --disable-debugger \
+    --load /root/quicklisp/setup.lisp \
+    --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
+    --eval '(ql:quickload :pazuzu)'
+```
 
 ## Install
 
@@ -27,7 +67,7 @@ git clone https://github.com/theesfeld/pazuzu.git
 cd pazuzu
 sbcl --noinform --disable-debugger \
   --load ~/quicklisp/setup.lisp \
-  --eval '(asdf:load-asd "pazuzu.asd")' \
+  --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
   --eval '(ql:quickload :pazuzu)'
 ```
 
@@ -73,7 +113,7 @@ From the clone directory:
 ```sh
 sbcl --noinform --disable-debugger \
   --load ~/quicklisp/setup.lisp \
-  --eval '(asdf:load-asd "pazuzu.asd")' \
+  --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
   --eval '(ql:quickload :pazuzu)' \
   --eval '(pazuzu:main)' \
   -- examples/config.lisp
@@ -236,6 +276,8 @@ If `LISTEN_PID` is this process and `LISTEN_FDS` is a positive integer, pazuzu a
 
 `LISTEN_FDNAMES`, when set, is a colon-separated list. `http`, `https`, `web`, an empty name, or a missing name is the main listener. `metrics` is the Prometheus listener. `redirect` is the cleartext redirect listener. With no names, the first descriptor is the main listener. `:port` is not used for an adopted main listener.
 
+`examples/pazuzu.socket` and `examples/pazuzu.service` are a socket-activated unit. `systemctl enable --now pazuzu.socket` passes the listening socket. The sample socket binds `127.0.0.1:8080` and names it `http`.
+
 ## Use it from Lisp
 
 `start` accepts the same keys as the configuration file. Paths are pathnames or namestrings. Port `0` binds an ephemeral port.
@@ -304,18 +346,24 @@ The behavior locked by the test suite is recorded in [CONFORMANCE.md](CONFORMANC
 
 ## Tests
 
-From the clone directory, with `curl` built with nghttp2, ngtcp2, brotli, and zstd, plus `node`, `openssl`, and `timeout`:
+From the clone directory, with the `curl` from `script/build-deps.sh` on `PATH`, plus `node`, `openssl`, and `timeout`. HTTP/3 checks also need an aioquic interpreter at `/tmp/pazuzu-h3venv/bin/python` (`python3 -m venv /tmp/pazuzu-h3venv && /tmp/pazuzu-h3venv/bin/pip install 'aioquic==1.2.0'`).
+
+h2spec 2.6.0, against a cleartext listener, is the HTTP/2 check named in [CONFORMANCE.md](CONFORMANCE.md). `script/h2spec-server.lisp` starts that listener on `127.0.0.1:18080` after pazuzu is loaded:
 
 ```sh
-sbcl --noinform --disable-debugger \
+h2spec -h 127.0.0.1 -p 18080
+```
+
+```sh
+sbcl --dynamic-space-size 4096 --noinform --disable-debugger \
   --load ~/quicklisp/setup.lisp \
-  --eval '(asdf:load-asd "pazuzu.asd")' \
+  --eval '(asdf:load-asd (truename "pazuzu.asd"))' \
   --eval '(ql:quickload :pazuzu)' \
   --eval '(asdf:test-system :pazuzu)' \
   --quit
 ```
 
-`asdf:test-system` runs `pazuzu/tests:run`.
+`asdf:test-system` runs `pazuzu/tests:run`. `--dynamic-space-size 4096` gives the compiler room for the large test functions. The server itself does not need that heap.
 
 ## License
 
