@@ -1592,12 +1592,6 @@ listener."
             (ignore-errors (usocket:socket-close (cdr pair)))))
         (values main metrics redirect quic)))))
 
-(defun clear-cloexec (fd)
-  "Leave FD open across exec."
-  (let ((flags (%fcntl fd 1 0)))
-    (when (>= flags 0)
-      (%fcntl fd 2 (logand flags (lognot 1))))))
-
 (defun activation-records (server)
   "((fd . name) ...) for the sockets a new image should inherit."
   (let ((records nil)
@@ -1618,20 +1612,47 @@ listener."
     (nreverse records)))
 
 (defun handoff-script ()
-  "script/handoff.sh from the source tree, or the copy installed beside the libraries."
+  "script/handoff.py from the source tree, or the copy installed beside the libraries."
   (let ((candidates (list
                      (ignore-errors
-                       (asdf:system-relative-pathname :pazuzu "script/handoff.sh"))
-                     (merge-pathnames "../lib/pazuzu/handoff.sh"
+                       (asdf:system-relative-pathname :pazuzu "script/handoff.py"))
+                     (merge-pathnames "../lib/pazuzu/handoff.py"
                                       sb-ext:*runtime-pathname*))))
     (or (find-if (lambda (path) (and path (probe-file path))) candidates)
-        (error "handoff.sh was not found"))))
+        (error "handoff.py was not found"))))
 
-(defun read-handoff-status (fd)
-  (let ((stream (sb-sys:make-fd-stream fd :input t :element-type 'character
-                                          :buffering :none :name "handoff")))
-    (unwind-protect (read-line stream nil nil)
-      (close stream))))
+(defun send-file-descriptors (fd descriptors)
+  "Send DESCRIPTORS to the peer of the stream socket FD with SCM_RIGHTS."
+  (let* ((count (length descriptors))
+         (payload (* count 4))
+         (cmsg-len (+ 16 payload))
+         (cmsg-space (logand (+ cmsg-len 7) (lognot 7))))
+    (cffi:with-foreign-objects ((iov '(:struct iovec))
+                                (message '(:struct msghdr))
+                                (control :uint8 cmsg-space)
+                                (byte :uint8))
+      (loop for index below cmsg-space
+            do (setf (cffi:mem-ref control :uint8 index) 0))
+      (setf (cffi:mem-ref byte :uint8) 0)
+      (setf (iovec-ref iov 'iov-base) byte
+            (iovec-ref iov 'iov-len) 1)
+      (setf (msghdr-ref message 'msg-name) (cffi:null-pointer)
+            (msghdr-ref message 'msg-namelen) 0
+            (msghdr-ref message 'msg-iov) iov
+            (msghdr-ref message 'msg-iovlen) 1
+            (msghdr-ref message 'msg-control) control
+            (msghdr-ref message 'msg-controllen) cmsg-space
+            (msghdr-ref message 'msg-flags) 0)
+      ;; SOL_SOCKET is 1 and SCM_RIGHTS is 1. The ints follow the 16-byte header.
+      (setf (cmsg-ref control 'cmsg-len) cmsg-len
+            (cmsg-ref control 'cmsg-level) 1
+            (cmsg-ref control 'cmsg-type) 1)
+      (loop for descriptor in descriptors
+            for index from 0
+            do (setf (cffi:mem-ref control :int (+ 16 (* index 4))) descriptor))
+      (let ((sent (%sendmsg fd message 0)))
+        (unless (= sent 1)
+          (error "sendmsg of listening sockets failed (~d)" (errno)))))))
 
 (defun reexec-program ()
   "The wrapper beside a saved image, or this runtime when there is no wrapper."
@@ -1652,37 +1673,55 @@ the parent's copies. Existing accepted connections stay with this process
 until it drains."
   (unless (and (stringp program) (probe-file program))
     (error "reexec program ~s was not found" program))
-  (let ((records (activation-records server)))
+  (let ((records (activation-records server))
+        (sock-path (format nil "/tmp/pazuzu-handoff-~d-~d"
+                           (sb-posix:getpid)
+                           (random 1000000))))
     (unless records
       (error "no listening sockets to hand off"))
-    (dolist (record records)
-      (clear-cloexec (car record)))
-    (multiple-value-bind (read-fd write-fd) (sb-posix:pipe)
-      (clear-cloexec write-fd)
-      (let ((env (list* (format nil "PAZUZU_FDS=~{~d~^,~}" (mapcar #'car records))
-                        (format nil "PAZUZU_FDNAMES=~{~a~^:~}" (mapcar #'cdr records))
-                        (format nil "PAZUZU_HANDOFF_STATUS=~d" write-fd)
-                        (remove-if (lambda (entry)
-                                     (let ((text (string entry)))
-                                       (or (eql (search "LISTEN_" text) 0)
-                                           (eql (search "PAZUZU_FDS=" text) 0)
-                                           (eql (search "PAZUZU_FDNAMES=" text) 0)
-                                           (eql (search "PAZUZU_HANDOFF_STATUS=" text) 0))))
-                                   (sb-ext:posix-environ)))))
-        (apply #'sb-ext:run-program
-               "/bin/bash"
-               (append (list (namestring (handoff-script)) program) arguments)
-               :environment env
-               :wait nil
-               :preserve-fds (append (mapcar #'car records) (list write-fd))
-               (if output
-                   (list :output output :if-output-exists :supersede :error :output)
-                   '(:output t :error t)))
-        (sb-posix:close write-fd)
-        (let ((line (sb-sys:with-deadline (:seconds 10)
-                      (read-handoff-status read-fd))))
-          (unless (and line (search "ready" line))
-            (error "handoff child did not become ready (~s)" line)))))
+    (ignore-errors (delete-file sock-path))
+    (let ((listener (make-instance 'sb-bsd-sockets:local-socket :type :stream)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind listener sock-path)
+             (sb-bsd-sockets:socket-listen listener 1)
+             (let* ((env (list* (format nil "PAZUZU_HANDOFF_SOCK=~a" sock-path)
+                                (format nil "PAZUZU_FDNAMES=~{~a~^:~}"
+                                        (mapcar #'cdr records))
+                                (remove-if (lambda (entry)
+                                             (let ((text (string entry)))
+                                               (or (eql (search "LISTEN_" text) 0)
+                                                   (eql (search "PAZUZU_HANDOFF_SOCK=" text) 0)
+                                                   (eql (search "PAZUZU_FDNAMES=" text) 0))))
+                                           (sb-ext:posix-environ))))
+                    (process (apply #'sb-ext:run-program
+                                    "python3"
+                                    (append (list (namestring (handoff-script)) program)
+                                            arguments)
+                                    :environment env
+                                    :wait nil
+                                    :search t
+                                    :output :stream
+                                    (if output
+                                        (list :error output :if-error-exists :supersede)
+                                        '(:error t)))))
+               (let ((accepted (sb-sys:with-deadline (:seconds 10)
+                                 (sb-bsd-sockets:socket-accept listener))))
+                 (unwind-protect
+                      (send-file-descriptors
+                       (sb-bsd-sockets:socket-file-descriptor accepted)
+                       (mapcar #'car records))
+                   (ignore-errors (sb-bsd-sockets:socket-close accepted))))
+               (let ((line (sb-sys:with-deadline (:seconds 10)
+                             (read-line (sb-ext:process-output process) nil nil))))
+                 (unless (and line (search "ready" line))
+                   (error "handoff child did not become ready (~s)~@[~%~a~]"
+                          line
+                          (and output
+                               (ignore-errors
+                                 (alexandria:read-file-into-string output))))))))
+        (ignore-errors (sb-bsd-sockets:socket-close listener))
+        (ignore-errors (delete-file sock-path)))))
     ;; The child holds its own descriptors. Closing these stops accept here.
     (dolist (listener (copy-list (server-listeners server)))
       (ignore-errors (usocket:socket-close listener)))
@@ -1691,7 +1730,7 @@ until it drains."
     (when (server-quic-socket server)
       (ignore-errors (sb-bsd-sockets:socket-close (server-quic-socket server))))
     (setf (server-running server) nil)
-    t))
+    t)
 
 (defun parse-ipv4-host (text)
   "Four decimal octets, 0-255, with no leading zero. NIL otherwise."
