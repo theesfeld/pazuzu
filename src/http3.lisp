@@ -606,11 +606,13 @@ value as a property list (base pointer, length)."
         (note-thread server
                      (bt:make-thread
                       (lambda ()
-                        (let ((result (handler-case (dispatch server request)
+                        (let* ((*request-id* (new-request-id))
+                               (result (handler-case (dispatch server request)
                                         (protocol-error (condition)
                                           (protocol-error-response condition))
                                         (error (condition)
-                                          (format *error-output* "pazuzu: ~a~%" condition)
+                                          (format *error-output* "pazuzu: [~a] ~a~%"
+                                                  (or *request-id* "-") condition)
                                           (plain-error 500)))))
                           (h3-queue conn id
                                     (if (eq result :websocket) (plain-error 400) result)
@@ -2112,9 +2114,23 @@ of the datagram. Trailing padding stays with the preceding packet."
           (push (h3-simple-slice packet from len) slices)
           (nreverse slices)))))
 
+(defun h3-guard-conn (endpoint conn thunk)
+  "Run THUNK for one connection. An error retires CONN and leaves the rest."
+  (handler-case (funcall thunk)
+    (error (condition)
+      (format *error-output* "pazuzu: http3 connection: ~a~%" condition)
+      (when (and endpoint conn)
+        (ignore-errors (h3-retire endpoint conn))))))
+
 (defun h3-read-conn (endpoint conn packet host port &optional (ecn 0))
   (when (or (null (h3-conn-quic conn)) (h3-conn-freed conn) (h3-conn-closing conn))
     (return-from h3-read-conn nil))
+  (h3-guard-conn endpoint conn
+                 (lambda () (h3-read-conn-body endpoint conn packet host port ecn))))
+
+(defun h3-read-conn-body (endpoint conn packet host port &optional (ecn 0))
+  (when (or (null (h3-conn-quic conn)) (h3-conn-freed conn) (h3-conn-closing conn))
+    (return-from h3-read-conn-body nil))
   (h3-remember-peer conn host port)
   ;; RFC 9000 §10.3.1. A datagram that cannot be decrypted can still be
   ;; a Stateless Reset. Matching a used token enters draining and sends
@@ -2122,7 +2138,7 @@ of the datagram. Trailing padding stays with the preceding packet."
   ;; decrypt cannot hide the token.
   (when (h3-stateless-reset-p conn packet)
     (h3-retire endpoint conn)
-    (return-from h3-read-conn nil))
+    (return-from h3-read-conn-body nil))
   (cffi:with-foreign-objects ((path :uint8 96) (pkt-info :uint8 8) (local :uint8 28) (remote :uint8 28))
     (let ((local-len (fill-sockaddr local (h3-endpoint-local-host endpoint)
                                     (h3-endpoint-local-port endpoint)))
@@ -2399,10 +2415,12 @@ is CONNECTION_REFUSED and does not consume a connection."
 (defun h3-write-all (endpoint)
   (dolist (conn (h3-connections endpoint))
     (when (and (h3-conn-quic conn) (not (h3-conn-freed conn)) (not (h3-conn-closing conn)))
-      (h3-resume-conn conn)
-      (loop for burst below 32
-            for n = (h3-write-packet endpoint conn)
-            while (and (numberp n) (plusp n))))))
+      (h3-guard-conn endpoint conn
+                     (lambda ()
+                       (h3-resume-conn conn)
+                       (loop for burst below 32
+                             for n = (h3-write-packet endpoint conn)
+                             while (and (numberp n) (plusp n))))))))
 
 (defun h3-handle-expiries (endpoint now)
   (dolist (conn (h3-connections endpoint))

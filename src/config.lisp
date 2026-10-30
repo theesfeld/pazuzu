@@ -9,6 +9,9 @@
 (defvar *shutdown-flag* nil
   "Set from SIGINT and SIGTERM. MAIN returns after STOP.")
 
+(defvar *handoff-flag* nil
+  "Set from SIGUSR2. The reload thread execs a new image with the sockets.")
+
 (defvar *signals-installed* nil)
 
 (defun read-config (path)
@@ -43,7 +46,7 @@ WITH-STANDARD-IO-SYNTAX binds *read-eval* to true, so the nil binding is inside 
                 :redirect-port :access-log :error-log
                 :metrics-address :metrics-port :metrics-token
                 :request-rate :user :group :cors
-                :swank-port :slynk-port
+                :swank-port :slynk-port :heap-limit
                 :root :directories :hosts)
           :test #'eq))
 
@@ -304,6 +307,7 @@ Every present key is passed, including an explicit NIL such as :read-timeout.
                (:user (setf (getf args :user) value))
                (:group (setf (getf args :group) value))
                (:cors (setf (getf args :cors) (config-cors value)))
+               (:heap-limit (setf (getf args :heap-limit) value))
                ((:root :directories :hosts :swank-port :slynk-port))
                (t (error "Unknown configuration key ~s" key))))
     args))
@@ -385,6 +389,10 @@ workers and routes as they were."
              (:slynk-port
               (when value
                 (start-listener :interface :slynk :port value)))
+             (:heap-limit
+              (unless (or (null value) (and (integerp value) (plusp value)))
+                (error "heap-limit must be a positive integer or nil"))
+              (setf (server-heap-limit server) value))
              ((:root :directories :hosts)))))
 
 (defun reload (server)
@@ -412,9 +420,10 @@ reopen the logs, and load the certificate chain again."
 
 SIGINT and SIGTERM stop accepting, drain in-flight connections, then exit.
 SIGHUP reloads workers, limits, timeouts, HSTS, CORS, log paths, the metrics
-token, the certificate chain, and the file mappings. The listen address,
-ports, backlog, and the process account stay as they were at start.
-Restart the process to change those.
+token, the certificate chain, the heap limit, and the file mappings. The
+listen address, ports, backlog, and the process account stay as they were
+at start. SIGUSR2 hands the listening sockets to a new copy of this program
+and then drains. Restart the process to change the address or ports.
 ")
 
 (defun pazuzu-init-library-path ()
@@ -529,6 +538,10 @@ variable does nothing, so a process started by hand is unchanged."
                              (lambda (signal info context)
                                (declare (ignore signal info context))
                                (setf *reload-flag* t)))
+    (sb-sys:enable-interrupt sb-posix:sigusr2
+                             (lambda (signal info context)
+                               (declare (ignore signal info context))
+                               (setf *handoff-flag* t)))
     (flet ((shutdown (signal info context)
              (declare (ignore signal info context))
              (setf *shutdown-flag* t)))
@@ -544,7 +557,18 @@ sets a flag."
                (bt:make-thread
                 (lambda ()
                   (loop while (server-running server)
-                        do (when *reload-flag*
+                        do (when *handoff-flag*
+                             (setf *handoff-flag* nil)
+                             (handler-case
+                                 (progn
+                                   (reexec server
+                                           :program (reexec-program)
+                                           :arguments (rest sb-ext:*posix-argv*))
+                                   (stop server :drain-seconds *shutdown-drain-seconds*))
+                               (error (condition)
+                                 (error-log (server-logger server) "error"
+                                            "handoff failed: ~a" condition))))
+                           (when *reload-flag*
                              (setf *reload-flag* nil)
                              (handler-case (reload server)
                                (error (condition)

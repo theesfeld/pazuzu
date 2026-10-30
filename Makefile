@@ -65,9 +65,11 @@ install: binary
 	sed 's|@PREFIX@|$(PREFIX)|g' packaging/pazuzu.service \
 	  > $(DESTDIR)/etc/systemd/system/pazuzu.service
 	install -m 0644 packaging/pazuzu.socket $(DESTDIR)/etc/systemd/system/pazuzu.socket
+	install -m 0755 script/handoff.py $(DESTDIR)$(PREFIX)/lib/pazuzu/handoff.py
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/pazuzu $(DESTDIR)$(PREFIX)/bin/pazuzu-bin
+	rm -f $(DESTDIR)$(PREFIX)/lib/pazuzu/handoff.py
 	rm -rf $(DESTDIR)$(PREFIX)/lib/pazuzu
 	rm -f $(DESTDIR)/etc/systemd/system/pazuzu.service
 	rm -f $(DESTDIR)/etc/systemd/system/pazuzu.socket

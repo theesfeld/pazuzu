@@ -773,7 +773,8 @@ A body in the same buffer is allowed to skip 100 (RFC 9110 §10.1.1)."
          (h2-submit conn stream (too-many-response) :provider t))
         (t
          (handler-case
-             (let* ((request (build-origin-request conn stream 20))
+             (let* ((*request-id* (new-request-id))
+                    (request (build-origin-request conn stream 20))
                     (result (dispatch (h2-conn-server conn) request)))
                (if (eq result :websocket)
                    (h2-fail conn stream 400)

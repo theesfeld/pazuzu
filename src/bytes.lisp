@@ -28,6 +28,15 @@
 (defvar *saw-request-octet* nil
   "Set when a request read consumes an octet. Idle timeouts stay quiet.")
 
+(defvar *request-id* nil
+  "Id of the request running on this thread, or NIL.")
+
+(defun new-request-id ()
+  "Sixteen hex digits. Unique enough to join an access line with an error."
+  (with-output-to-string (out)
+    (loop repeat 16
+          do (write-char (aref "0123456789abcdef" (random 16)) out))))
+
 (defvar *read-ahead* nil
   "Per-connection header buffer. SERVE-STREAM binds it. Writes stay on the
 socket stream, so this does not sit on the response path.")

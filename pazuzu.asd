@@ -51,6 +51,7 @@
                              (:file "quic-http")
                              (:file "operate")
                              (:file "app")
+                             (:file "reliability")
                              (:file "run"))))
   :perform (test-op (op system)
              (uiop:symbol-call :pazuzu/tests :run)))
