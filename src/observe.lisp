@@ -145,16 +145,18 @@ is skipped when the log level is error."
     (30 "3")
     (t "1.1")))
 
-(defun access-log (logger &key peer request status bytes referer user-agent time)
-  "Write one line in the Combined Log Format."
-  (let ((line (format nil "~a - - ~a \"~a\" ~d ~a \"~a\" \"~a\""
+(defun access-log (logger &key peer request status bytes referer user-agent time
+                            (id *request-id*))
+  "Write one line in the Combined Log Format, with id= when a request id is bound."
+  (let ((line (format nil "~a - - ~a \"~a\" ~d ~a \"~a\" \"~a\"~@[ id=~a~]"
                       (or peer "-")
                       (access-time (or time (get-universal-time)))
                       (log-quote request)
                       status
                       (if bytes (princ-to-string bytes) "-")
                       (log-quote (or referer "-"))
-                      (log-quote (or user-agent "-")))))
+                      (log-quote (or user-agent "-"))
+                      id)))
     (when *access-on-stdout*
       (write-log-line *standard-output* line))
     (when (and logger (logger-access-stream logger))

@@ -48,6 +48,9 @@
   (rate-windows (make-hash-table :test #'equal))
   ;; Functions of (request next), outer first, around every route handler.
   (middleware nil)
+  ;; NIL does not refuse connections for memory. A byte count refuses
+  ;; new work while SBCL's dynamic space is above it.
+  heap-limit
   user
   group
   config-path
@@ -139,14 +142,15 @@ the route handler. The list is replaced under the server lock."
 
 (defun call-with-chain (handler request chain)
   "Call HANDLER on REQUEST after CHAIN. A symbol is funcalled, so the
-current definition runs."
-  (labels ((call-at (index)
+current definition runs. NEXT receives the request the middleware passes."
+  (labels ((call-at (index request)
              (if (>= index (length chain))
                  (funcall handler request)
                  (funcall (nth index chain)
                           request
-                          (lambda (request) (call-at (1+ index)))))))
-    (call-at 0)))
+                          (lambda (next-request)
+                            (call-at (1+ index) next-request))))))
+    (call-at 0 request)))
 
 (defun invoke-route (server route request)
   "Run ROUTE's handler inside the middleware chain.
@@ -777,9 +781,15 @@ Tests use that to prove a request stats a file once.")
                  (remove-headers (response-headers response) "alt-svc"))))
   response)
 
+(defun heap-pressured-p (server)
+  "True when SERVER's heap watermark is set and dynamic space is above it."
+  (let ((limit (server-heap-limit server)))
+    (and limit (> (sb-kernel:dynamic-usage) limit))))
+
 (defun origin-decorate (server request response)
   "Add HSTS, CORS, and Alt-Svc. Used by every origin response, including
-HTTP/2 and HTTP/3. The cleartext redirect listener does not call this."
+HTTP/2 and HTTP/3. The cleartext redirect listener does not call this.
+The request id stays in the logs so it does not change header order."
   (apply-hsts server request response)
   (apply-cors server request response)
   (apply-alt-svc server request response)
@@ -842,7 +852,8 @@ The global cap counts HTTP/3 connections as well."
   (bt:with-lock-held ((server-lock server))
     (let* ((peer (peer-name socket))
            (from-peer (gethash peer (server-peers server) 0)))
-      (cond ((or (>= (connection-count server) (server-max-connections server))
+      (cond ((heap-pressured-p server) nil)
+            ((or (>= (connection-count server) (server-max-connections server))
                  (>= from-peer (server-max-connections-per-peer server)))
              nil)
             (t
@@ -857,7 +868,8 @@ The global cap counts HTTP/3 connections as well."
 Returns T when the connection is admitted."
   (bt:with-lock-held ((server-lock server))
     (let ((from-peer (gethash peer (server-peers server) 0)))
-      (cond ((or (>= (connection-count server) (server-max-connections server))
+      (cond ((heap-pressured-p server) nil)
+            ((or (>= (connection-count server) (server-max-connections server))
                  (>= from-peer (server-max-connections-per-peer server)))
              nil)
             (t
@@ -976,7 +988,8 @@ finish with the status the method and target already decide."
 (defun serve-one-stream (server stream &key scheme peer redirect)
   (handler-case
       (loop
-        (let ((started (get-internal-real-time))
+        (let ((*request-id* (new-request-id))
+              (started (get-internal-real-time))
               (request (read-origin-request server stream scheme peer :early (not redirect))))
           (if (request-limited-p server peer)
               (let ((response (origin-decorate server request (too-many-response))))
@@ -1037,7 +1050,8 @@ finish with the status the method and target already decide."
       (note-response server nil (plain-error 500))
       (ignore-errors
         (write-response stream nil (plain-error 500) :close-connection t))
-      (error-log (server-logger server) "error" "pazuzu: ~a" condition))))
+      (error-log (server-logger server) "error" "pazuzu: [~a] ~a"
+                 (or *request-id* "-") condition))))
 
 (cffi:defcfun ("SSL_CTX_up_ref" ssl-ctx-up-ref :library cl+ssl::libssl) :int
   (ctx :pointer))
@@ -1139,9 +1153,11 @@ status is visible inside the session."
                                   :scheme "http"
                                   :peer (peer-name socket)))))))))
 
-(defun serve-client (server socket &key tls redirect)
+(defun serve-client (server socket &key tls redirect admitted)
+  "Serve SOCKET. ADMITTED means the accept thread already reserved a slot.
+A refusal does not take a slot. The thread that writes 503 is not a client."
   (unwind-protect
-       (cond ((not (admit-client server socket))
+       (cond ((not admitted)
               (ignore-errors (reject-over-capacity server socket :tls tls)))
              (t
               (unwind-protect
@@ -1149,7 +1165,8 @@ status is visible inside the session."
                        (serve-admitted server socket :tls tls :redirect redirect)
                      (error (condition)
                        (error-log (server-logger server) "error"
-                                  "pazuzu: connection failed: ~a" condition)))
+                                  "pazuzu: [~a] connection failed: ~a"
+                                  (or *request-id* "-") condition)))
                 (forget-client server socket))))
     (ignore-errors (usocket:socket-close socket))))
 
@@ -1173,11 +1190,19 @@ until STOP."
                        ;; HTTP/2 sets this again. HTTP/1 did not, so any
                        ;; body past one segment waited on delayed ACK.
                        (set-tcp-nodelay (usocket-fd client))
-                       (note-thread server
-                                    (bt:make-thread
-                                     (lambda ()
-                                       (serve-client server client :tls tls :redirect redirect))
-                                     :name "pazuzu-client"))))
+                       ;; Reserve the slot before the thread exists, so a
+                       ;; refused connection cannot sit in the cap.
+                       (let ((admitted (admit-client server client)))
+                         (note-thread server
+                                      (bt:make-thread
+                                       (lambda ()
+                                         (serve-client server client
+                                                       :tls tls
+                                                       :redirect redirect
+                                                       :admitted admitted))
+                                       :name (if admitted
+                                                 "pazuzu-client"
+                                                 "pazuzu-reject"))))))
                  (error ()
                    (unless (server-running server)
                      (return)))))))
@@ -1567,6 +1592,107 @@ listener."
             (ignore-errors (usocket:socket-close (cdr pair)))))
         (values main metrics redirect quic)))))
 
+(defun clear-cloexec (fd)
+  "Leave FD open across exec."
+  (let ((flags (%fcntl fd 1 0)))
+    (when (>= flags 0)
+      (%fcntl fd 2 (logand flags (lognot 1))))))
+
+(defun activation-records (server)
+  "((fd . name) ...) for the sockets a new image should inherit."
+  (let ((records nil)
+        (main (server-main-listener server)))
+    (when main
+      (push (cons (usocket-fd main)
+                  (if (server-main-tls server) "https" "http"))
+            records))
+    (dolist (listener (server-listeners server))
+      (unless (eq listener main)
+        (push (cons (usocket-fd listener) "redirect") records)))
+    (when (server-metrics-listener server)
+      (push (cons (usocket-fd (server-metrics-listener server)) "metrics") records))
+    (when (server-quic-socket server)
+      (push (cons (sb-bsd-sockets:socket-file-descriptor (server-quic-socket server))
+                  "quic")
+            records))
+    (nreverse records)))
+
+(defun handoff-script ()
+  "script/handoff.sh from the source tree, or the copy installed beside the libraries."
+  (let ((candidates (list
+                     (ignore-errors
+                       (asdf:system-relative-pathname :pazuzu "script/handoff.sh"))
+                     (merge-pathnames "../lib/pazuzu/handoff.sh"
+                                      sb-ext:*runtime-pathname*))))
+    (or (find-if (lambda (path) (and path (probe-file path))) candidates)
+        (error "handoff.sh was not found"))))
+
+(defun read-handoff-status (fd)
+  (let ((stream (sb-sys:make-fd-stream fd :input t :element-type 'character
+                                          :buffering :none :name "handoff")))
+    (unwind-protect (read-line stream nil nil)
+      (close stream))))
+
+(defun reexec-program ()
+  "The wrapper beside a saved image, or this runtime when there is no wrapper."
+  (let* ((runtime sb-ext:*runtime-pathname*)
+         (wrapper (merge-pathnames "pazuzu" runtime)))
+    (namestring
+     (if (and (probe-file wrapper)
+              (ignore-errors
+                (not (equal (truename wrapper) (truename runtime)))))
+         wrapper
+         runtime))))
+
+(defun reexec (server &key program arguments output)
+  "Hand the listening sockets to a new process and stop accepting here.
+PROGRAM is the executable. ARGUMENTS are its argv, without argv0.
+The child is ready to inherit the descriptors before this function closes
+the parent's copies. Existing accepted connections stay with this process
+until it drains."
+  (unless (and (stringp program) (probe-file program))
+    (error "reexec program ~s was not found" program))
+  (let ((records (activation-records server)))
+    (unless records
+      (error "no listening sockets to hand off"))
+    (dolist (record records)
+      (clear-cloexec (car record)))
+    (multiple-value-bind (read-fd write-fd) (sb-posix:pipe)
+      (clear-cloexec write-fd)
+      (let ((env (list* (format nil "PAZUZU_FDS=~{~d~^,~}" (mapcar #'car records))
+                        (format nil "PAZUZU_FDNAMES=~{~a~^:~}" (mapcar #'cdr records))
+                        (format nil "PAZUZU_HANDOFF_STATUS=~d" write-fd)
+                        (remove-if (lambda (entry)
+                                     (let ((text (string entry)))
+                                       (or (eql (search "LISTEN_" text) 0)
+                                           (eql (search "PAZUZU_FDS=" text) 0)
+                                           (eql (search "PAZUZU_FDNAMES=" text) 0)
+                                           (eql (search "PAZUZU_HANDOFF_STATUS=" text) 0))))
+                                   (sb-ext:posix-environ)))))
+        (apply #'sb-ext:run-program
+               "/bin/bash"
+               (append (list (namestring (handoff-script)) program) arguments)
+               :environment env
+               :wait nil
+               :preserve-fds (append (mapcar #'car records) (list write-fd))
+               (if output
+                   (list :output output :if-output-exists :supersede :error :output)
+                   '(:output t :error t)))
+        (sb-posix:close write-fd)
+        (let ((line (sb-sys:with-deadline (:seconds 10)
+                      (read-handoff-status read-fd))))
+          (unless (and line (search "ready" line))
+            (error "handoff child did not become ready (~s)" line)))))
+    ;; The child holds its own descriptors. Closing these stops accept here.
+    (dolist (listener (copy-list (server-listeners server)))
+      (ignore-errors (usocket:socket-close listener)))
+    (when (server-metrics-listener server)
+      (ignore-errors (usocket:socket-close (server-metrics-listener server))))
+    (when (server-quic-socket server)
+      (ignore-errors (sb-bsd-sockets:socket-close (server-quic-socket server))))
+    (setf (server-running server) nil)
+    t))
+
 (defun parse-ipv4-host (text)
   "Four decimal octets, 0-255, with no leading zero. NIL otherwise."
   (let ((parts (uiop:split-string text :separator '(#\.))))
@@ -1740,6 +1866,7 @@ reference, so the context is freed when the last of those closes."
                    metrics-port
                    metrics-token
                    request-rate
+                   heap-limit
                    user group
                    cors)
   "Start an origin server. With CERTIFICATE and PRIVATE-KEY the TCP listener is
@@ -1773,6 +1900,8 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
     (error "metrics-token must be a string, not ~s" metrics-token))
   (when (and request-rate (not (and (integerp request-rate) (>= request-rate 0))))
     (error "request-rate must be a non-negative integer or nil, not ~s" request-rate))
+  (when (and heap-limit (not (and (integerp heap-limit) (plusp heap-limit))))
+    (error "heap-limit must be a positive integer or nil, not ~s" heap-limit))
   (when (and user (not (stringp user)))
     (error "user must be a string, not ~s" user))
   (when (and group (not (stringp group)))
@@ -1795,6 +1924,7 @@ HTTP/2 GOAWAY and HTTP/3 H3_NO_ERROR before it closes sockets."
                                :metrics-address metrics-address
                                :metrics-token metrics-token
                                :request-rate (and request-rate (plusp request-rate) request-rate)
+                               :heap-limit heap-limit
                                :user user
                                :group group
                                :https-port (if https port nil))))
